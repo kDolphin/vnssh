@@ -718,6 +718,9 @@ def wizard_field_visible(key: str, data: WizardData) -> bool:
         return False
     if key == "save_password" and data.auth == AUTH_KEY:
         return False
+    # 密码留空时不保存 Keychain，无需再问
+    if key == "save_password" and not data.password:
+        return False
     return True
 
 
@@ -774,7 +777,10 @@ def run_wizard(
         if key == "auth":
             safe_addstr(stdscr, 3, 4, "1=密码  2=密钥  3=密码+密钥", curses.A_DIM)
         if key == "password" and data.auth != AUTH_KEY:
-            safe_addstr(stdscr, 3, 4, "留空则连接时手动输入", curses.A_DIM)
+            hint = "留空则连接时手动输入，不写入 Keychain"
+            if data.original_host and keychain_has(data.original_host):
+                hint = "留空则删除 Keychain 密码，连接时手动输入"
+            safe_addstr(stdscr, 3, 4, hint, curses.A_DIM)
 
         initial = wizard_field_initial(key, data)
         value = read_line_input(stdscr, 5, 4, width - 8, initial, secret=secret)
