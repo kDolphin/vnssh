@@ -84,7 +84,6 @@ class WizardData:
     auth: str = AUTH_PASSWORD
     identity_file: str = DEFAULT_IDENTITY
     password: str = ""
-    save_password: bool = True
     original_host: str = ""
 
 
@@ -575,10 +574,11 @@ def connect_host(host: str, use_keychain: bool = True) -> None:
     os.execvp("ssh", ssh_args)
 
 
-def apply_password_changes(host: str, password: str, save: bool) -> None:
-    if save and password:
+def apply_keychain_password(host: str, password: str) -> None:
+    """有密码就写入 Keychain；留空则删除已有条目。"""
+    if password:
         keychain_set(host, password)
-    elif not save:
+    else:
         keychain_delete(host)
 
 
@@ -702,12 +702,10 @@ WIZARD_FIELDS_FULL = [
     ("auth", "认证方式 [1密码 2密钥 3两者]: ", False),
     ("identity_file", "密钥路径: ", False),
     ("password", "登录密码 (可留空): ", True),
-    ("save_password", "保存密码到 Keychain [Y/n]: ", False),
 ]
 
 WIZARD_FIELDS_PASSWORD_ONLY = [
     ("password", "登录密码 (留空删除): ", True),
-    ("save_password", "保存到 Keychain [Y/n]: ", False),
 ]
 
 
@@ -716,17 +714,10 @@ def wizard_field_visible(key: str, data: WizardData) -> bool:
         return False
     if key == "password" and data.auth == AUTH_KEY:
         return False
-    if key == "save_password" and data.auth == AUTH_KEY:
-        return False
-    # 密码留空时不保存 Keychain，无需再问
-    if key == "save_password" and not data.password:
-        return False
     return True
 
 
 def wizard_field_initial(key: str, data: WizardData) -> str:
-    if key == "save_password":
-        return "Y" if data.save_password else "n"
     if key == "auth":
         return {"password": "1", "key": "2", "both": "3"}.get(data.auth, "1")
     return str(getattr(data, key, ""))
@@ -754,8 +745,6 @@ def apply_wizard_field(key: str, data: WizardData, value: str) -> Optional[str]:
         data.identity_file = value.strip() or DEFAULT_IDENTITY
     elif key == "password":
         data.password = value
-    elif key == "save_password":
-        data.save_password = value.strip().lower() not in ("n", "no")
     return None
 
 
@@ -777,9 +766,7 @@ def run_wizard(
         if key == "auth":
             safe_addstr(stdscr, 3, 4, "1=密码  2=密钥  3=密码+密钥", curses.A_DIM)
         if key == "password" and data.auth != AUTH_KEY:
-            hint = "留空则连接时手动输入，不写入 Keychain"
-            if data.original_host and keychain_has(data.original_host):
-                hint = "留空则删除 Keychain 密码，连接时手动输入"
+            hint = "输入即保存到 Keychain；留空则删除已有密码，连接时手动输入"
             safe_addstr(stdscr, 3, 4, hint, curses.A_DIM)
 
         initial = wizard_field_initial(key, data)
@@ -816,10 +803,7 @@ def wizard_new(stdscr) -> Optional[WizardData]:
         return None
     upsert_host_block(result)
     if result.auth in (AUTH_PASSWORD, AUTH_BOTH):
-        if result.password and result.save_password:
-            keychain_set(result.host, result.password)
-        elif not result.password:
-            keychain_delete(result.host)
+        apply_keychain_password(result.host, result.password)
     else:
         keychain_delete(result.host)
     return result
@@ -837,7 +821,6 @@ def wizard_edit(stdscr, conn: Connection) -> Optional[WizardData]:
             auth=conn.auth,
             identity_file=conn.identity_file or DEFAULT_IDENTITY,
             password=keychain_get(conn.host) or "",
-            save_password=conn.has_password,
             original_host=conn.host,
         )
         result = run_wizard(stdscr, "编辑", data, WIZARD_FIELDS_FULL)
@@ -845,10 +828,7 @@ def wizard_edit(stdscr, conn: Connection) -> Optional[WizardData]:
             return None
         upsert_host_block(result)
         if result.auth in (AUTH_PASSWORD, AUTH_BOTH):
-            if result.password and result.save_password:
-                keychain_set(result.host, result.password)
-            elif not result.password:
-                keychain_delete(result.host)
+            apply_keychain_password(result.host, result.password)
         else:
             keychain_delete(result.host)
         return result
@@ -858,16 +838,12 @@ def wizard_edit(stdscr, conn: Connection) -> Optional[WizardData]:
     data = WizardData(
         host=conn.host,
         password=keychain_get(conn.host) or "",
-        save_password=conn.has_password,
         original_host=conn.host,
     )
     result = run_wizard(stdscr, "编辑密码", data, WIZARD_FIELDS_PASSWORD_ONLY)
     if result is None:
         return None
-    if result.password and result.save_password:
-        keychain_set(result.host, result.password)
-    else:
-        keychain_delete(result.host)
+    apply_keychain_password(result.host, result.password)
     return result
 
 
