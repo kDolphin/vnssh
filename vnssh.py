@@ -1068,9 +1068,10 @@ class MainUI:
         else:
             curses.curs_set(0)
 
-        attr = curses.color_pair(1) if self.focus_search and curses.has_colors() else (
-            curses.A_REVERSE if self.focus_search else 0
-        )
+        if self.focus_search:
+            attr = curses.color_pair(2) | curses.A_BOLD if curses.has_colors() else curses.A_BOLD
+        else:
+            attr = curses.A_DIM
         line = f"{search_label}{search_text}"
         safe_addstr(stdscr, 2, 2, line.ljust(max(0, width - 4))[: max(0, width - 4)], attr)
         if self.focus_search:
