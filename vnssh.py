@@ -372,7 +372,8 @@ def load_connections() -> List[Connection]:
             port = int(port_str)
         except ValueError:
             port = DEFAULT_PORT
-        identity = resolved.get("identityfile") or opts.get("identityfile")
+        # Only explicit config IdentityFile counts; ssh -G lists system defaults.
+        identity = opts.get("identityfile")
         has_pw = keychain_has(host)
         auth = infer_auth({"identityfile": identity or ""}, has_pw)
         connections.append(
@@ -514,6 +515,16 @@ def sorted_connections(connections: List[Connection], query: str) -> List[Connec
 # ---------------------------------------------------------------------------
 
 
+def askpass_program() -> str:
+    """Absolute path used as SSH_ASKPASS (OpenSSH execs this directly)."""
+    return str(Path(sys.argv[0]).resolve())
+
+
+def is_askpass_mode() -> bool:
+    # OpenSSH runs SSH_ASKPASS without extra args; VNSSH_HOST marks askpass calls.
+    return bool(os.environ.get("VNSSH_HOST"))
+
+
 def askpass_main() -> None:
     host = os.environ.get("VNSSH_HOST", "")
     if not host:
@@ -526,16 +537,42 @@ def askpass_main() -> None:
     sys.exit(0)
 
 
+def connection_auth_mode(host: str) -> str:
+    raw = gather_raw_hosts()
+    entry = raw.get(host)
+    opts = entry[0] if entry else {}
+    has_identity = bool(opts.get("identityfile"))
+    has_pw = keychain_has(host)
+    return infer_auth({"identityfile": opts.get("identityfile", "")}, has_pw)
+
+
+def build_ssh_argv(host: str) -> List[str]:
+    args = ["ssh"]
+    mode = connection_auth_mode(host)
+    if mode == AUTH_PASSWORD and keychain_has(host):
+        args.extend(
+            [
+                "-o",
+                "PreferredAuthentications=password",
+                "-o",
+                "PubkeyAuthentication=no",
+            ]
+        )
+    args.append(host)
+    return args
+
+
 def connect_host(host: str, use_keychain: bool = True) -> None:
     record_use(host)
+    ssh_args = build_ssh_argv(host)
     env = os.environ.copy()
     if use_keychain and keychain_has(host):
         env["VNSSH_HOST"] = host
-        env["SSH_ASKPASS"] = sys.argv[0]
+        env["SSH_ASKPASS"] = askpass_program()
         env["SSH_ASKPASS_REQUIRE"] = "force"
         env["DISPLAY"] = env.get("DISPLAY", ":0")
-        os.execvpe("ssh", ["ssh", host], env)
-    os.execvp("ssh", ["ssh", host])
+        os.execvpe("ssh", ssh_args, env)
+    os.execvp("ssh", ssh_args)
 
 
 def apply_password_changes(host: str, password: str, save: bool) -> None:
@@ -1069,7 +1106,7 @@ def cmd_connect(host: str) -> None:
 
 
 def main() -> None:
-    if "--askpass" in sys.argv:
+    if is_askpass_mode() or "--askpass" in sys.argv:
         askpass_main()
 
     if len(sys.argv) > 1:
