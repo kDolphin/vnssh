@@ -677,7 +677,8 @@ def build_ssh_argv(host: str) -> List[str]:
     return args
 
 
-def connect_host(host: str, use_keychain: bool = True) -> None:
+def connect_host(host: str, use_keychain: bool = True, exec_mode: bool = True) -> int:
+    """Run ssh. exec_mode=True replaces process (CLI); False returns exit code (TUI)."""
     record_use(host)
     ssh_args = build_ssh_argv(host)
     env = os.environ.copy()
@@ -686,8 +687,12 @@ def connect_host(host: str, use_keychain: bool = True) -> None:
         env["SSH_ASKPASS"] = askpass_program()
         env["SSH_ASKPASS_REQUIRE"] = "force"
         env["DISPLAY"] = env.get("DISPLAY", ":0")
-        os.execvpe("ssh", ssh_args, env)
-    os.execvp("ssh", ssh_args)
+        if exec_mode:
+            os.execvpe("ssh", ssh_args, env)
+        return subprocess.call(ssh_args, env=env)
+    if exec_mode:
+        os.execvp("ssh", ssh_args)
+    return subprocess.call(ssh_args)
 
 
 def apply_keychain_password(host: str, password: str) -> None:
@@ -1036,6 +1041,14 @@ class MainUI:
         if self.cursor > max_cursor:
             self.cursor = max_cursor
 
+    def resume_after_ssh(self) -> None:
+        self.stdscr = curses.initscr()
+        curses.cbreak()
+        self.stdscr.keypad(True)
+        curses.set_escdelay(25)
+        init_colors()
+        self.reload_connections()
+
     def menu_items(self) -> List[Optional[Connection]]:
         items: List[Optional[Connection]] = [None]
         for conn in self.filtered[:LIST_SLOTS]:
@@ -1164,8 +1177,8 @@ class MainUI:
                     self.reload_connections()
                 else:
                     curses.endwin()
-                    connect_host(selected.host)
-                    return
+                    connect_host(selected.host, exec_mode=False)
+                    self.resume_after_ssh()
             elif action == "edit":
                 if selected is None:
                     self.message = "请选择一条连接再编辑"
@@ -1207,7 +1220,7 @@ def cmd_list() -> None:
 
 def cmd_connect(host: str) -> None:
     ensure_include()
-    connect_host(host)
+    connect_host(host, exec_mode=True)
 
 
 # ---------------------------------------------------------------------------
