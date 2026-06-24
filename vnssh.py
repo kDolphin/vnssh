@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import csv
 import curses
 import json
 import os
@@ -37,6 +38,33 @@ AUTH_LABELS = {
     AUTH_PASSWORD: "密码登录",
     AUTH_KEY: "SSH 密钥",
     AUTH_BOTH: "密码 + 密钥",
+}
+
+IMPORT_COLUMNS = {
+    "host": ("host", "name", "alias", "名字", "名称", "连接名"),
+    "hostname": (
+        "hostname",
+        "host_name",
+        "ip",
+        "address",
+        "addr",
+        "域名",
+        "地址",
+        "主机",
+    ),
+    "user": ("user", "username", "account", "帐号", "账号", "用户"),
+    "port": ("port", "端口"),
+    "password": ("password", "pass", "pwd", "密码"),
+    "identity_file": (
+        "identity_file",
+        "identityfile",
+        "key",
+        "keyfile",
+        "private_key",
+        "密钥",
+        "密钥路径",
+    ),
+    "auth": ("auth", "认证", "认证方式"),
 }
 
 
@@ -1083,6 +1111,203 @@ def cmd_connect(host: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# CSV import
+# ---------------------------------------------------------------------------
+
+
+def normalize_import_header(name: str) -> Optional[str]:
+    key = name.strip().lower().replace(" ", "_")
+    for canonical, aliases in IMPORT_COLUMNS.items():
+        if key == canonical or key in aliases:
+            return canonical
+    return None
+
+
+def canonicalize_import_row(raw: Dict[str, str]) -> Dict[str, str]:
+    row: Dict[str, str] = {}
+    for key, value in raw.items():
+        if key is None:
+            continue
+        canonical = normalize_import_header(key)
+        if canonical and value is not None:
+            row[canonical] = value.strip()
+    return row
+
+
+def parse_import_auth(value: str, identity_file: str, password: str) -> str:
+    token = value.strip().lower()
+    if token in ("", "password", "pass", "1", "密码"):
+        return AUTH_PASSWORD
+    if token in ("key", "2", "密钥"):
+        return AUTH_KEY
+    if token in ("both", "3", "两者"):
+        return AUTH_BOTH
+    if identity_file and password:
+        return AUTH_BOTH
+    if identity_file:
+        return AUTH_KEY
+    return AUTH_PASSWORD
+
+
+def row_to_wizard(row: Dict[str, str]) -> WizardData:
+    host = row.get("host", "").strip()
+    hostname = row.get("hostname", "").strip()
+    user = row.get("user", "").strip()
+    if not host:
+        raise ValueError("缺少 host（连接名）")
+    if not hostname:
+        raise ValueError(f"{host}: 缺少 hostname（地址）")
+    if not user:
+        raise ValueError(f"{host}: 缺少 user（帐号）")
+
+    port = row.get("port", "").strip() or str(DEFAULT_PORT)
+    password = row.get("password", "")
+    identity_file = row.get("identity_file", "").strip()
+    auth = parse_import_auth(row.get("auth", ""), identity_file, password)
+
+    return WizardData(
+        host=host,
+        hostname=hostname,
+        user=user,
+        port=port,
+        auth=auth,
+        identity_file=identity_file or DEFAULT_IDENTITY,
+        password=password,
+    )
+
+
+def host_is_managed(host: str) -> bool:
+    raw = gather_raw_hosts()
+    entry = raw.get(host)
+    if not entry:
+        return False
+    return entry[1].resolve() == HOSTS_CONF.resolve()
+
+
+def host_exists(host: str) -> bool:
+    return host in gather_raw_hosts()
+
+
+def plan_import_action(data: WizardData, force: bool = False) -> str:
+    if host_exists(data.host):
+        if host_is_managed(data.host):
+            return "update_managed" if force else "skip_managed"
+        return "keychain_ext" if data.password else "skip_ext"
+    return "add"
+
+
+def import_wizard_data(data: WizardData, force: bool = False, dry_run: bool = False) -> str:
+    """Import one row. Returns action label for reporting."""
+    action = plan_import_action(data, force=force)
+    if dry_run:
+        return action
+
+    if action == "skip_managed" or action == "skip_ext":
+        return action
+
+    if action == "update_managed":
+        data.original_host = data.host
+        upsert_host_block(data)
+        if data.auth in (AUTH_PASSWORD, AUTH_BOTH):
+            apply_keychain_password(data.host, data.password)
+        else:
+            keychain_delete(data.host)
+        return action
+
+    if action == "keychain_ext":
+        apply_keychain_password(data.host, data.password)
+        return action
+
+    upsert_host_block(data)
+    if data.auth in (AUTH_PASSWORD, AUTH_BOTH):
+        apply_keychain_password(data.host, data.password)
+    else:
+        keychain_delete(data.host)
+    return "add"
+
+
+def read_import_csv(path: Path) -> List[WizardData]:
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        if not reader.fieldnames:
+            raise ValueError("CSV 缺少表头行")
+
+        rows: List[WizardData] = []
+        for line_no, raw in enumerate(reader, start=2):
+            if not any((value or "").strip() for value in raw.values()):
+                continue
+            canonical = canonicalize_import_row(raw)
+            try:
+                rows.append(row_to_wizard(canonical))
+            except ValueError as exc:
+                raise ValueError(f"第 {line_no} 行: {exc}") from exc
+        return rows
+
+
+def cmd_import(argv: List[str]) -> None:
+    force = "--force" in argv
+    dry_run = "--dry-run" in argv
+    paths = [arg for arg in argv if not arg.startswith("--")]
+
+    if len(paths) != 1:
+        print(
+            "用法: vnssh import [--dry-run] [--force] <file.csv>\n"
+            "\n"
+            "CSV 表头（中英文均可）:\n"
+            "  host, hostname, user, port, password, identity_file, auth\n"
+            "\n"
+            "规则:\n"
+            "  - 新 Host → 写入 ~/.vnssh/hosts.conf + Keychain\n"
+            "  - 已存在于 ~/.ssh/config [ext] → 仅导入 password 到 Keychain\n"
+            "  - 已存在于 hosts.conf → 默认跳过；--force 覆盖配置与密码\n"
+            "\n"
+            "auth 取值: password / key / both（或 1 / 2 / 3）"
+        )
+        sys.exit(1)
+
+    csv_path = Path(paths[0]).expanduser()
+    if not csv_path.exists():
+        print(f"文件不存在: {csv_path}")
+        sys.exit(1)
+
+    ensure_include()
+    rows = read_import_csv(csv_path)
+
+    stats = {
+        "add": 0,
+        "update_managed": 0,
+        "keychain_ext": 0,
+        "skip_managed": 0,
+        "skip_ext": 0,
+    }
+
+    prefix = "[dry-run] " if dry_run else ""
+
+    for data in rows:
+        action = import_wizard_data(data, force=force, dry_run=dry_run)
+
+        stats[action] = stats.get(action, 0) + 1
+
+        if action == "add":
+            print(f"{prefix}新增 {data.host} -> {data.user}@{data.hostname}")
+        elif action == "update_managed":
+            print(f"{prefix}覆盖 {data.host}")
+        elif action == "keychain_ext":
+            print(f"{prefix}仅 Keychain [ext] {data.host}")
+        elif action == "skip_managed":
+            print(f"{prefix}跳过（已存在于 hosts.conf）: {data.host}（可用 --force 覆盖）")
+        elif action == "skip_ext":
+            print(f"{prefix}跳过 [ext] {data.host}（无 password 列）")
+
+    print(
+        f"\n{prefix}完成: 新增 {stats['add']}, "
+        f"覆盖 {stats['update_managed']}, "
+        f"Keychain [ext] {stats['keychain_ext']}, "
+        f"跳过 {stats['skip_managed'] + stats['skip_ext']}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Entry
 # ---------------------------------------------------------------------------
 
@@ -1102,7 +1327,13 @@ def main() -> None:
         if cmd == "connect" and len(sys.argv) > 2:
             cmd_connect(sys.argv[2])
             return
-        print("用法: vnssh | vnssh init | vnssh list | vnssh connect <Host>")
+        if cmd == "import":
+            cmd_import(sys.argv[2:])
+            return
+        print(
+            "用法: vnssh | vnssh init | vnssh list | vnssh connect <Host> | "
+            "vnssh import [--dry-run] [--force] <file.csv>"
+        )
         sys.exit(1)
 
     curses.wrapper(main_curses)
