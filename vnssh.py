@@ -29,6 +29,10 @@ INCLUDE_MARKER = "Include ~/.vnssh/hosts.conf"
 FOLDER_COMMENT_PREFIX = "#v-f:"
 FOLDER_UNCATEGORIZED = "未分类"
 FOLDER_COL_WIDTH = 10
+SEARCH_PREFIX = "/ "
+SEARCH_CURSOR_BLINK_MS = 500
+BADGE_KEYCHAIN = "[P]"
+BADGE_IDENTITY = "[k]"
 DEFAULT_PORT = 22
 DEFAULT_IDENTITY = "~/.ssh/id_ed25519"
 LIST_SLOTS = 8
@@ -106,9 +110,9 @@ class Connection:
         if not self.managed:
             parts.append("[ext]")
         if self.has_password:
-            parts.append("🔑")
+            parts.append(BADGE_KEYCHAIN)
         if self.identity_file:
-            parts.append("🔐")
+            parts.append(BADGE_IDENTITY)
         return " ".join(parts)
 
 
@@ -1029,6 +1033,7 @@ class MainUI:
         self.connections: List[Connection] = []
         self.filtered: List[Connection] = []
         self.message = ""
+        self._blink_on = True
         self.reload_connections()
 
     def reload_connections(self) -> None:
@@ -1061,23 +1066,26 @@ class MainUI:
         height, width = stdscr.getmaxyx()
         draw_box_title(stdscr, "vnssh")
 
-        search_label = "🔍 "
         search_text = self.query
-        if self.focus_search and curses.curs_set:
-            curses.curs_set(1)
-        else:
-            curses.curs_set(0)
+        curses.curs_set(0)
 
         if self.focus_search:
             attr = curses.color_pair(2) | curses.A_BOLD if curses.has_colors() else curses.A_BOLD
         else:
             attr = curses.A_DIM
-        line = f"{search_label}{search_text}"
-        safe_addstr(stdscr, 2, 2, line.ljust(max(0, width - 4))[: max(0, width - 4)], attr)
-        if self.focus_search:
-            cursor_x = 2 + len(search_label) + len(search_text)
-            if cursor_x < width - 1:
-                stdscr.move(2, cursor_x)
+
+        row_x = 2
+        safe_addstr(stdscr, 2, row_x, SEARCH_PREFIX, attr)
+        row_x += len(SEARCH_PREFIX)
+        if search_text:
+            safe_addstr(stdscr, 2, row_x, search_text, attr)
+            row_x += len(search_text)
+        if self.focus_search and self._blink_on and row_x < width - 1:
+            cursor_char = "_" if not search_text else "|"
+            cursor_attr = attr | curses.A_REVERSE
+            safe_addstr(stdscr, 2, row_x, cursor_char, cursor_attr)
+        elif not search_text and not self.focus_search:
+            safe_addstr(stdscr, 2, row_x, "_", curses.A_DIM)
 
         safe_addstr(stdscr, 3, 2, "-" * max(0, width - 4))
 
@@ -1085,7 +1093,7 @@ class MainUI:
         row = 4
         for idx, item in enumerate(items):
             selected = not self.focus_search and self.cursor == idx
-            prefix = "▶ " if selected else "  "
+            prefix = "> " if selected else "  "
             if item is None:
                 text = "新建 SSH 连接"
             else:
@@ -1158,7 +1166,16 @@ class MainUI:
         while True:
             self.message = ""
             self.draw()
+            if self.focus_search:
+                self.stdscr.timeout(SEARCH_CURSOR_BLINK_MS)
+            else:
+                self.stdscr.timeout(-1)
+
             char, ch = getch_utf8(self.stdscr)
+
+            if ch == -1 and self.focus_search:
+                self._blink_on = not self._blink_on
+                continue
 
             if self.focus_search:
                 if not self.handle_search_key(ch, char):
