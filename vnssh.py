@@ -26,6 +26,9 @@ HISTORY_FILE = VNSSH_DIR / "history.json"
 SSH_CONFIG = Path.home() / ".ssh" / "config"
 KEYCHAIN_SERVICE = "vnssh"
 INCLUDE_MARKER = "Include ~/.vnssh/hosts.conf"
+FOLDER_COMMENT_PREFIX = "#v-f:"
+FOLDER_UNCATEGORIZED = "未分类"
+FOLDER_COL_WIDTH = 10
 DEFAULT_PORT = 22
 DEFAULT_IDENTITY = "~/.ssh/id_ed25519"
 LIST_SLOTS = 8
@@ -41,7 +44,8 @@ AUTH_LABELS = {
 }
 
 IMPORT_COLUMNS = {
-    "host": ("host", "name", "alias", "名字", "名称", "连接名"),
+    "host": ("host", "name", "alias", "session_name", "名字", "名称", "连接名"),
+    "folder": ("folder", "分组", "目录", "分类"),
     "hostname": (
         "hostname",
         "host_name",
@@ -83,6 +87,11 @@ class Connection:
     auth: str = AUTH_PASSWORD
     managed: bool = False
     has_password: bool = False
+    folder: str = FOLDER_UNCATEGORIZED
+
+    @property
+    def folder_display(self) -> str:
+        return self.folder or FOLDER_UNCATEGORIZED
 
     @property
     def label(self) -> str:
@@ -112,6 +121,7 @@ class WizardData:
     auth: str = AUTH_PASSWORD
     identity_file: str = DEFAULT_IDENTITY
     password: str = ""
+    folder: str = ""
     original_host: str = ""
 
 
@@ -258,22 +268,40 @@ def read_config_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
 
-def parse_host_blocks(text: str) -> List[Tuple[str, Dict[str, str]]]:
-    """Return list of (host_pattern, options dict) in file order."""
-    blocks: List[Tuple[str, Dict[str, str]]] = []
+def parse_folder_comment(line: str) -> Optional[str]:
+    stripped = line.strip()
+    if stripped.startswith(FOLDER_COMMENT_PREFIX):
+        return stripped[len(FOLDER_COMMENT_PREFIX) :].strip()
+    return None
+
+
+def normalize_folder(folder: str) -> str:
+    value = folder.strip()
+    return value if value else FOLDER_UNCATEGORIZED
+
+
+def parse_config_entries(text: str) -> List[Tuple[str, Dict[str, str], str]]:
+    """Return list of (host_pattern, options dict, folder) in file order."""
+    entries: List[Tuple[str, Dict[str, str], str]] = []
     current_hosts: List[str] = []
     current_opts: Dict[str, str] = {}
+    current_folder = FOLDER_UNCATEGORIZED
     in_match = False
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
-        if not line or line.startswith("#"):
+        if not line:
+            continue
+        if line.startswith("#"):
+            folder = parse_folder_comment(line)
+            if folder is not None:
+                current_folder = normalize_folder(folder)
             continue
         lower = line.lower()
         if lower.startswith("match "):
             if current_hosts and not in_match:
                 for h in current_hosts:
-                    blocks.append((h, dict(current_opts)))
+                    entries.append((h, dict(current_opts), current_folder))
             current_hosts = []
             current_opts = {}
             in_match = True
@@ -283,7 +311,7 @@ def parse_host_blocks(text: str) -> List[Tuple[str, Dict[str, str]]]:
         if lower.startswith("host "):
             if current_hosts:
                 for h in current_hosts:
-                    blocks.append((h, dict(current_opts)))
+                    entries.append((h, dict(current_opts), current_folder))
             parts = shlex.split(line)
             current_hosts = parts[1:] if len(parts) > 1 else []
             current_opts = {}
@@ -297,9 +325,9 @@ def parse_host_blocks(text: str) -> List[Tuple[str, Dict[str, str]]]:
 
     if current_hosts and not in_match:
         for h in current_hosts:
-            blocks.append((h, dict(current_opts)))
+            entries.append((h, dict(current_opts), current_folder))
 
-    return blocks
+    return entries
 
 
 def collect_includes(text: str, base_dir: Path) -> List[Path]:
@@ -334,9 +362,9 @@ def is_listable_host(name: str) -> bool:
     return True
 
 
-def gather_raw_hosts() -> Dict[str, Tuple[Dict[str, str], Path]]:
-    """Map host alias -> (options from first defining block, source file)."""
-    seen: Dict[str, Tuple[Dict[str, str], Path]] = {}
+def gather_raw_hosts() -> Dict[str, Tuple[Dict[str, str], Path, str]]:
+    """Map host alias -> (options, source file, folder)."""
+    seen: Dict[str, Tuple[Dict[str, str], Path, str]] = {}
     visited: set[Path] = set()
 
     def walk(path: Path) -> None:
@@ -345,9 +373,9 @@ def gather_raw_hosts() -> Dict[str, Tuple[Dict[str, str], Path]]:
             return
         visited.add(path)
         text = read_config_text(path)
-        for host_name, opts in parse_host_blocks(text):
+        for host_name, opts, folder in parse_config_entries(text):
             if is_listable_host(host_name) and host_name not in seen:
-                seen[host_name] = (opts, path)
+                seen[host_name] = (opts, path, folder)
         for include_path in collect_includes(text, path.parent):
             walk(include_path)
 
@@ -390,7 +418,7 @@ def load_connections() -> List[Connection]:
     connections: List[Connection] = []
     managed_path = HOSTS_CONF.resolve()
 
-    for host, (opts, source) in raw.items():
+    for host, (opts, source, folder) in raw.items():
         resolved = resolve_with_ssh_g(host)
         hostname = resolved.get("hostname") or opts.get("hostname", "")
         user = resolved.get("user") or opts.get("user", "")
@@ -413,6 +441,7 @@ def load_connections() -> List[Connection]:
                 auth=auth,
                 managed=source.resolve() == managed_path,
                 has_password=has_pw,
+                folder=folder,
             )
         )
 
@@ -443,7 +472,12 @@ def ensure_include() -> None:
 
 
 def format_host_block(data: WizardData) -> str:
-    lines = [f"Host {data.host}", f"    HostName {data.hostname}"]
+    folder = normalize_folder(data.folder)
+    lines = [
+        f"{FOLDER_COMMENT_PREFIX}{folder}",
+        f"Host {data.host}",
+        f"    HostName {data.hostname}",
+    ]
     if data.user:
         lines.append(f"    User {data.user}")
     port = data.port.strip() or str(DEFAULT_PORT)
@@ -460,7 +494,8 @@ def remove_host_block(host: str, path: Path = HOSTS_CONF) -> bool:
     if not text:
         return False
     pattern = re.compile(
-        rf"^Host\s+{re.escape(host)}\s*$.*?(?=^Host\s|\Z)",
+        rf"(?:^{re.escape(FOLDER_COMMENT_PREFIX)}.*\n)?"
+        rf"^Host\s+{re.escape(host)}\s*$.*?(?=^{re.escape(FOLDER_COMMENT_PREFIX)}|^Host\s|\Z)",
         re.MULTILINE | re.DOTALL,
     )
     new_text, count = pattern.subn("", text)
@@ -508,6 +543,7 @@ def connection_matches(conn: Connection, query: str) -> bool:
         conn.user,
         str(conn.port),
         conn.label,
+        conn.folder_display,
     ]
     return any(q in f.lower() for f in fields if f)
 
@@ -525,7 +561,9 @@ def match_rank(conn: Connection, query: str) -> Tuple[int, float]:
         return (2, -history_score(conn.host))
     if q in (conn.hostname or "").lower():
         return (3, -history_score(conn.host))
-    return (4, -history_score(conn.host))
+    if q in conn.folder_display.lower():
+        return (4, -history_score(conn.host))
+    return (5, -history_score(conn.host))
 
 
 def sorted_connections(connections: List[Connection], query: str) -> List[Connection]:
@@ -724,6 +762,7 @@ def read_line_input(
 
 WIZARD_FIELDS_FULL = [
     ("host", "名字 (Host): ", False),
+    ("folder", "分组 (留空=未分类): ", False),
     ("hostname", "地址 (IP/域名): ", False),
     ("port", f"端口 [{DEFAULT_PORT}]: ", False),
     ("user", "帐号 (User): ", False),
@@ -748,6 +787,9 @@ def wizard_field_visible(key: str, data: WizardData) -> bool:
 def wizard_field_initial(key: str, data: WizardData) -> str:
     if key == "auth":
         return {"password": "1", "key": "2", "both": "3"}.get(data.auth, "1")
+    if key == "folder":
+        folder = str(getattr(data, "folder", ""))
+        return "" if folder in ("", FOLDER_UNCATEGORIZED) else folder
     return str(getattr(data, key, ""))
 
 
@@ -757,6 +799,8 @@ def apply_wizard_field(key: str, data: WizardData, value: str) -> Optional[str]:
         if not value:
             return "名字不能为空"
         data.host = value
+    elif key == "folder":
+        data.folder = value.strip()
     elif key == "hostname":
         data.hostname = value.strip()
         if not data.hostname:
@@ -843,6 +887,7 @@ def wizard_edit(stdscr, conn: Connection) -> Optional[WizardData]:
         draw_box_title(stdscr, f"编辑 {conn.host}")
         data = WizardData(
             host=conn.host,
+            folder=conn.folder_display,
             hostname=conn.hostname,
             port=str(conn.port),
             user=conn.user,
@@ -978,7 +1023,9 @@ class MainUI:
                 text = "新建 SSH 连接"
             else:
                 badges = f" {item.badges}" if item.badges else ""
-                text = f"{item.host:<16} {item.label}{badges}"
+                folder = item.folder_display[:FOLDER_COL_WIDTH].ljust(FOLDER_COL_WIDTH)
+                host_col = item.host[:14].ljust(14)
+                text = f"{folder} {host_col} {item.label}{badges}"
             item_attr = curses.color_pair(1) if selected and curses.has_colors() else (
                 curses.A_REVERSE if selected else 0
             )
@@ -1102,7 +1149,7 @@ def cmd_list() -> None:
     ensure_include()
     for conn in sorted_connections(load_connections(), ""):
         badges = conn.badges
-        print(f"{conn.host}\t{conn.label}\t{badges}")
+        print(f"{conn.folder_display}\t{conn.host}\t{conn.label}\t{badges}")
 
 
 def cmd_connect(host: str) -> None:
@@ -1167,6 +1214,7 @@ def row_to_wizard(row: Dict[str, str]) -> WizardData:
 
     return WizardData(
         host=host,
+        folder=row.get("folder", "").strip(),
         hostname=hostname,
         user=user,
         port=port,
@@ -1254,7 +1302,7 @@ def cmd_import(argv: List[str]) -> None:
             "用法: vnssh import [--dry-run] [--force] <file.csv>\n"
             "\n"
             "CSV 表头（中英文均可）:\n"
-            "  host, hostname, user, port, password, identity_file, auth\n"
+            "  host, folder, hostname, user, port, password, identity_file, auth\n"
             "\n"
             "规则:\n"
             "  - 新 Host → 写入 ~/.vnssh/hosts.conf + Keychain\n"
