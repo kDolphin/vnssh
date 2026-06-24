@@ -150,7 +150,7 @@ def keychain_get(account: str) -> Optional[str]:
 
 
 def keychain_set(account: str, password: str) -> None:
-    keychain_delete(account)
+    keychain_delete(account, invalidate=False)
     proc = subprocess.run(
         [
             "security",
@@ -167,9 +167,10 @@ def keychain_set(account: str, password: str) -> None:
     )
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or "无法写入 Keychain")
+    invalidate_keychain_cache()
 
 
-def keychain_delete(account: str) -> None:
+def keychain_delete(account: str, invalidate: bool = True) -> None:
     subprocess.run(
         [
             "security",
@@ -182,10 +183,47 @@ def keychain_delete(account: str) -> None:
         capture_output=True,
         text=True,
     )
+    if invalidate:
+        invalidate_keychain_cache()
+
+
+_KEYCHAIN_ACCOUNTS_CACHE: Optional[set[str]] = None
+
+
+def invalidate_keychain_cache() -> None:
+    global _KEYCHAIN_ACCOUNTS_CACHE
+    _KEYCHAIN_ACCOUNTS_CACHE = None
+
+
+def load_keychain_accounts() -> set[str]:
+    """Load all vnssh Keychain account names in one dump (fast)."""
+    global _KEYCHAIN_ACCOUNTS_CACHE
+    if _KEYCHAIN_ACCOUNTS_CACHE is not None:
+        return _KEYCHAIN_ACCOUNTS_CACHE
+
+    accounts: set[str] = set()
+    keychain_path = Path.home() / "Library/Keychains/login.keychain-db"
+    if keychain_path.exists():
+        proc = subprocess.run(
+            ["security", "dump-keychain", str(keychain_path)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if proc.returncode == 0:
+            for block in re.split(r'class: "genp"', proc.stdout)[1:]:
+                if KEYCHAIN_SERVICE not in block:
+                    continue
+                match = re.search(r'"acct"<blob>="([^"]+)"', block)
+                if match:
+                    accounts.add(match.group(1))
+
+    _KEYCHAIN_ACCOUNTS_CACHE = accounts
+    return accounts
 
 
 def keychain_has(account: str) -> bool:
-    return keychain_get(account) is not None
+    return account in load_keychain_accounts()
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +442,25 @@ def resolve_with_ssh_g(host: str) -> Dict[str, str]:
     return result
 
 
+def resolve_connection_fields(host: str, opts: Dict[str, str]) -> Tuple[str, str, int]:
+    """Prefer parsed config; ssh -G only when HostName is missing."""
+    hostname = opts.get("hostname", "")
+    user = opts.get("user", "")
+    port_str = opts.get("port", str(DEFAULT_PORT))
+
+    if not hostname:
+        resolved = resolve_with_ssh_g(host)
+        hostname = resolved.get("hostname") or hostname
+        user = resolved.get("user") or user
+        port_str = resolved.get("port") or port_str
+
+    try:
+        port = int(port_str)
+    except ValueError:
+        port = DEFAULT_PORT
+    return hostname, user, port
+
+
 def infer_auth(opts: Dict[str, str], has_password: bool) -> str:
     identity = opts.get("identityfile", "")
     if identity and has_password:
@@ -417,19 +474,12 @@ def load_connections() -> List[Connection]:
     raw = gather_raw_hosts()
     connections: List[Connection] = []
     managed_path = HOSTS_CONF.resolve()
+    keychain_accounts = load_keychain_accounts()
 
     for host, (opts, source, folder) in raw.items():
-        resolved = resolve_with_ssh_g(host)
-        hostname = resolved.get("hostname") or opts.get("hostname", "")
-        user = resolved.get("user") or opts.get("user", "")
-        port_str = resolved.get("port") or opts.get("port", str(DEFAULT_PORT))
-        try:
-            port = int(port_str)
-        except ValueError:
-            port = DEFAULT_PORT
-        # Only explicit config IdentityFile counts; ssh -G lists system defaults.
+        hostname, user, port = resolve_connection_fields(host, opts)
         identity = opts.get("identityfile")
-        has_pw = keychain_has(host)
+        has_pw = host in keychain_accounts
         auth = infer_auth({"identityfile": identity or ""}, has_pw)
         connections.append(
             Connection(
@@ -974,10 +1024,13 @@ class MainUI:
         self.connections: List[Connection] = []
         self.filtered: List[Connection] = []
         self.message = ""
-        self.reload()
+        self.reload_connections()
 
-    def reload(self) -> None:
+    def reload_connections(self) -> None:
         self.connections = load_connections()
+        self.apply_filter()
+
+    def apply_filter(self) -> None:
         self.filtered = sorted_connections(self.connections, self.query)
         max_cursor = min(LIST_SLOTS, len(self.filtered))
         if self.cursor > max_cursor:
@@ -1043,12 +1096,12 @@ class MainUI:
     def handle_search_key(self, ch: int, char: Optional[str]) -> bool:
         if ch in (8, 127, curses.KEY_BACKSPACE):
             self.query = self.query[:-1]
-            self.reload()
+            self.apply_filter()
             return True
         if ch == 27:
             if self.query:
                 self.query = ""
-                self.reload()
+                self.apply_filter()
                 return True
             return False
         if ch in (curses.KEY_DOWN, 9):
@@ -1057,7 +1110,7 @@ class MainUI:
             return True
         if char and char.isprintable() and len(char) == 1:
             self.query += char
-            self.reload()
+            self.apply_filter()
             return True
         return True
 
@@ -1108,7 +1161,7 @@ class MainUI:
             if action == "activate":
                 if selected is None:
                     wizard_new(self.stdscr)
-                    self.reload()
+                    self.reload_connections()
                 else:
                     curses.endwin()
                     connect_host(selected.host)
@@ -1118,13 +1171,13 @@ class MainUI:
                     self.message = "请选择一条连接再编辑"
                 else:
                     wizard_edit(self.stdscr, selected)
-                    self.reload()
+                    self.reload_connections()
             elif action == "delete":
                 if selected is None:
                     self.message = "请选择一条连接再删除"
                 else:
                     if delete_connection(self.stdscr, selected):
-                        self.reload()
+                        self.reload_connections()
 
 
 def main_curses(stdscr) -> None:
