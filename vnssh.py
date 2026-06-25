@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import csv
 import curses
+import gzip
 import json
 import os
 import re
@@ -92,6 +93,7 @@ class Connection:
     managed: bool = False
     has_password: bool = False
     folder: str = FOLDER_UNCATEGORIZED
+    search_blob: str = ""
 
     @property
     def folder_display(self) -> str:
@@ -485,19 +487,19 @@ def load_connections() -> List[Connection]:
         identity = opts.get("identityfile")
         has_pw = host in keychain_accounts
         auth = infer_auth({"identityfile": identity or ""}, has_pw)
-        connections.append(
-            Connection(
-                host=host,
-                hostname=hostname,
-                user=user,
-                port=port,
-                identity_file=identity,
-                auth=auth,
-                managed=source.resolve() == managed_path,
-                has_password=has_pw,
-                folder=folder,
-            )
+        conn = Connection(
+            host=host,
+            hostname=hostname,
+            user=user,
+            port=port,
+            identity_file=identity,
+            auth=auth,
+            managed=source.resolve() == managed_path,
+            has_password=has_pw,
+            folder=folder,
         )
+        conn.search_blob = build_search_blob(conn)
+        connections.append(conn)
 
     return connections
 
@@ -583,23 +585,82 @@ def upsert_host_block(data: WizardData) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Search, sort, filter
+# Search, sort, filter (with optional pinyin matching)
 # ---------------------------------------------------------------------------
+
+_PINYIN_LUT: Optional[Dict[str, str]] = None
+PINYIN_LUT_PATH = Path(__file__).resolve().parent / "pinyin.json.gz"
+
+
+def load_pinyin_lut() -> Dict[str, str]:
+    global _PINYIN_LUT
+    if _PINYIN_LUT is not None:
+        return _PINYIN_LUT
+
+    lut: Dict[str, str] = {}
+    if PINYIN_LUT_PATH.exists():
+        try:
+            payload = gzip.decompress(PINYIN_LUT_PATH.read_bytes())
+            lut = json.loads(payload.decode("utf-8"))
+        except (OSError, json.JSONDecodeError, gzip.BadGzipFile):
+            lut = {}
+
+    _PINYIN_LUT = lut
+    return lut
+
+
+def pinyin_keys(text: str) -> str:
+    """Return full-pinyin and initials strings for mixed Chinese/Latin text."""
+    lut = load_pinyin_lut()
+    if not lut:
+        return ""
+
+    full: List[str] = []
+    initials: List[str] = []
+    for char in text:
+        if "\u4e00" <= char <= "\u9fff":
+            syllable = lut.get(char)
+            if not syllable:
+                continue
+            full.append(syllable)
+            initials.append(syllable[0])
+        elif char.isascii() and char.isalnum():
+            lower = char.lower()
+            full.append(lower)
+            initials.append(lower)
+
+    if not full:
+        return ""
+    return f"{''.join(full)} {''.join(initials)}"
+
+
+def build_search_blob(conn: Connection) -> str:
+    parts = [
+        conn.host,
+        conn.hostname,
+        conn.user,
+        str(conn.port),
+        conn.folder_display,
+        conn.label,
+    ]
+    tokens: List[str] = []
+    for part in parts:
+        if not part:
+            continue
+        tokens.append(part.lower())
+        py = pinyin_keys(part)
+        if py:
+            tokens.append(py)
+    return " ".join(tokens)
 
 
 def connection_matches(conn: Connection, query: str) -> bool:
     if not query:
         return True
     q = query.lower()
-    fields = [
-        conn.host,
-        conn.hostname,
-        conn.user,
-        str(conn.port),
-        conn.label,
-        conn.folder_display,
-    ]
-    return any(q in f.lower() for f in fields if f)
+    if q in conn.search_blob:
+        return True
+    return False
 
 
 def match_rank(conn: Connection, query: str) -> Tuple[int, float]:
@@ -617,7 +678,13 @@ def match_rank(conn: Connection, query: str) -> Tuple[int, float]:
         return (3, -history_score(conn.host))
     if q in conn.folder_display.lower():
         return (4, -history_score(conn.host))
-    return (5, -history_score(conn.host))
+
+    py = pinyin_keys(conn.folder_display) + " " + pinyin_keys(conn.host)
+    if py and q in py:
+        return (5, -history_score(conn.host))
+    if q in conn.search_blob:
+        return (6, -history_score(conn.host))
+    return (7, -history_score(conn.host))
 
 
 def sorted_connections(connections: List[Connection], query: str) -> List[Connection]:
