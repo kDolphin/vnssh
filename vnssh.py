@@ -966,8 +966,56 @@ def askpass_env(host: str, base: Optional[Dict[str, str]] = None) -> Dict[str, s
     return env
 
 
+def known_hosts_ports(hostname: str) -> List[int]:
+    """Ports previously used for hostname according to ~/.ssh/known_hosts."""
+    path = Path.home() / ".ssh" / "known_hosts"
+    if not path.exists() or not hostname:
+        return []
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    ports: List[int] = []
+    seen: set[int] = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        bracket = re.match(rf"^\[{re.escape(hostname)}\]:(\d+)\s", line)
+        if bracket:
+            port = int(bracket.group(1))
+        elif re.match(rf"^{re.escape(hostname)}\s", line):
+            port = DEFAULT_PORT
+        else:
+            continue
+        if port not in seen:
+            seen.add(port)
+            ports.append(port)
+    return ports
+
+
+def connect_error_port_hint(host: str) -> str:
+    raw = gather_raw_hosts()
+    entry = raw.get(host)
+    if not entry:
+        return ""
+    hostname, _, port = resolve_connection_fields(host, entry[0])
+    if not hostname:
+        return ""
+    others = [p for p in known_hosts_ports(hostname) if p != port]
+    if not others:
+        return ""
+    if len(others) == 1:
+        return f"try port {others[0]}"
+    joined = ", ".join(str(p) for p in others)
+    return f"known_hosts lists ports {joined}"
+
+
 def format_connect_error(host: str, result: ConnectResult) -> str:
     err = (result.stderr or "").strip()
+    port_hint = connect_error_port_hint(host)
+    port_suffix = f"; {port_hint}" if port_hint else ""
+
     if "Permission denied" in err:
         if not keychain_has(host):
             return f"{host}: authentication failed (no saved password; press e to store)"
@@ -980,18 +1028,25 @@ def format_connect_error(host: str, result: ConnectResult) -> str:
         return f"{host}: hostname could not be resolved"
     for phrase in ("Connection refused", "Operation timed out", "Connection timed out"):
         if phrase in err:
-            return f"{host}: {phrase.lower()}"
+            return f"{host}: {phrase.lower()}{port_suffix}"
+    if "Connection closed by" in err or "kex_exchange_identification" in err:
+        return (
+            f"{host}: server closed connection "
+            f"(not a password issue; check port/VPN/firewall{port_suffix})"
+        )
+    if "Connection reset" in err or "Broken pipe" in err:
+        return f"{host}: network connection dropped (check VPN or port{port_suffix})"
     for line in reversed(err.splitlines()):
         text = line.strip()
         if not text or text.startswith("Warning:"):
             continue
         if "Pseudo-terminal will not be allocated" in text:
             continue
+        if "post-quantum key exchange" in text:
+            continue
         return f"{host}: {text[:100]}"
     if result.returncode != 0:
-        if not keychain_has(host):
-            return f"{host}: connection failed (enter password at prompt, or e to save)"
-        return f"{host}: connection failed (check password/key or VPN)"
+        return f"{host}: connection failed (check port, VPN, or network{port_suffix})"
     return f"{host}: connection closed"
 
 
@@ -1077,12 +1132,15 @@ def sync_pty_window_size(master_fd: int, tty_fd: int) -> None:
         pass
 
 
-def run_ssh_with_tty(argv: List[str], env: Dict[str, str]) -> int:
+def run_ssh_with_tty(argv: List[str], env: Dict[str, str]) -> Tuple[int, str]:
     """Run ssh on a pty; relay via /dev/tty so prompts work after curses."""
     tty_fd = open_controlling_tty()
     if tty_fd is None and not sys.stdin.isatty():
-        return subprocess.call(argv, env=env)
+        proc = subprocess.run(argv, env=env, capture_output=True, text=True)
+        err = (proc.stderr or proc.stdout or "").strip()
+        return proc.returncode, err
 
+    output = bytearray()
     pid, master_fd = pty.fork()
     if pid == 0:
         if tty_fd is not None:
@@ -1106,6 +1164,7 @@ def run_ssh_with_tty(argv: List[str], env: Dict[str, str]) -> int:
                     break
                 if not data:
                     break
+                output.extend(data)
                 os.write(terminal_fd, data)
             if terminal_fd in readable:
                 try:
@@ -1121,11 +1180,12 @@ def run_ssh_with_tty(argv: List[str], env: Dict[str, str]) -> int:
         os.close(master_fd)
         _, status = os.waitpid(pid, 0)
 
+    err_text = output.decode("utf-8", errors="replace").strip()
     if os.WIFEXITED(status):
-        return os.WEXITSTATUS(status)
+        return os.WEXITSTATUS(status), err_text
     if os.WIFSIGNALED(status):
-        return 128 + os.WTERMSIG(status)
-    return 1
+        return 128 + os.WTERMSIG(status), err_text
+    return 1, err_text
 
 
 def connect_host(
@@ -1152,10 +1212,11 @@ def connect_host(
         os.execvpe("ssh", ssh_args, env)
 
     if use_askpass:
-        returncode = subprocess.call(ssh_args, env=env)
-    else:
-        returncode = run_ssh_with_tty(ssh_args, env)
-    return ConnectResult(returncode)
+        proc = subprocess.run(ssh_args, env=env, stderr=subprocess.PIPE, text=True)
+        stderr = (proc.stderr or "").strip()
+        return ConnectResult(proc.returncode, stderr=stderr)
+    returncode, stderr = run_ssh_with_tty(ssh_args, env)
+    return ConnectResult(returncode, stderr=stderr)
 
 
 def apply_keychain_password(host: str, password: str) -> None:
