@@ -21,7 +21,6 @@ import sys
 import termios
 import tty
 import unicodedata
-import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1486,13 +1485,63 @@ def restore_tty_attrs(fd: int, attrs: Optional[List]) -> None:
         pass
 
 
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+_PASSWORD_PROMPT_MARKERS = (
+    re.compile(r"(?i)please input password"),
+    re.compile(r"(?i)password of operation account"),
+    re.compile(r"(?i)\[LOGIN\].*password"),
+)
+
+_VERIFICATION_PROMPT_MARKERS = (
+    re.compile(r"(?i)verification\s*code"),
+    re.compile(r"(?i)\botp\b"),
+    re.compile(r"(?i)one[- ]time"),
+    re.compile(r"(?i)2fa"),
+    re.compile(r"(?i)mfa"),
+    re.compile(r"验证码"),
+    re.compile(r"二次验证"),
+)
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_ESCAPE.sub("", text)
+
+
+def should_auto_send_password(recent_text: str) -> bool:
+    """True when the latest PTY output is the saved-password prompt (not 2FA)."""
+    clean = _strip_ansi(recent_text)
+    lines = [line.strip() for line in clean.splitlines() if line.strip()]
+    if not lines:
+        return False
+    for line in reversed(lines[-6:]):
+        if any(marker.search(line) for marker in _VERIFICATION_PROMPT_MARKERS):
+            return False
+        if any(marker.search(line) for marker in _PASSWORD_PROMPT_MARKERS):
+            return True
+        lower = line.lower()
+        if "[login]" in lower and "password" in lower:
+            return True
+    return False
+
+
+def clear_askpass_env(env: Dict[str, str]) -> None:
+    for var in (
+        "SSH_ASKPASS",
+        "SSH_ASKPASS_REQUIRE",
+        "VNSSH_HOST",
+        "VNSSH_ASKPASS_SESSION",
+    ):
+        env.pop(var, None)
+
+
 def run_ssh_with_tty(argv: List[str], env: Dict[str, str]) -> Tuple[int, str]:
     """Run ssh on a pty; relay via /dev/tty so prompts work after curses."""
-    askpass_session = env.get("VNSSH_ASKPASS_SESSION", "")
-    _, askpass_lock = askpass_session_paths(askpass_session) if askpass_session else (
-        None,
-        None,
-    )
+    auto_password_host = env.get("VNSSH_AUTO_PASSWORD_HOST", "")
+    auto_password: Optional[str] = None
+    if auto_password_host and keychain_has(auto_password_host):
+        auto_password = keychain_get(auto_password_host)
+    password_sent = False
 
     tty_fd = open_controlling_tty()
     if tty_fd is None and not sys.stdin.isatty():
@@ -1530,10 +1579,7 @@ def run_ssh_with_tty(argv: List[str], env: Dict[str, str]) -> Tuple[int, str]:
             if resize_pending:
                 resize_pending = False
                 sync_pty_window_size(master_fd, terminal_fd)
-            relay_fds = [master_fd]
-            if askpass_lock is None or not askpass_lock.exists():
-                relay_fds.append(terminal_fd)
-            readable, _, _ = select.select(relay_fds, [], [], 0.2)
+            readable, _, _ = select.select([master_fd, terminal_fd], [], [], 0.2)
             if master_fd in readable:
                 try:
                     data = os.read(master_fd, 8192)
@@ -1543,6 +1589,13 @@ def run_ssh_with_tty(argv: List[str], env: Dict[str, str]) -> Tuple[int, str]:
                     break
                 output.extend(data)
                 os.write(terminal_fd, data)
+                if auto_password and not password_sent:
+                    recent = output.decode("utf-8", errors="replace")
+                    if should_auto_send_password(recent):
+                        password_sent = True
+                        payload = (auto_password + "\n").encode("utf-8")
+                        os.write(master_fd, payload)
+                        output.extend(payload)
             if terminal_fd in readable:
                 try:
                     data = os.read(terminal_fd, 8192)
@@ -1568,38 +1621,38 @@ def run_ssh_with_tty(argv: List[str], env: Dict[str, str]) -> Tuple[int, str]:
 
 
 def prepare_ssh_invocation(
-    host: str, *, legacy: bool, use_keychain: bool
+    host: str, *, legacy: bool, use_keychain: bool, interactive: bool = True
 ) -> Tuple[List[str], Dict[str, str], bool]:
     ssh_args = build_ssh_argv(host, legacy=legacy)
     env = os.environ.copy()
-    use_askpass = use_keychain and keychain_has(host)
-    if use_askpass:
+    use_keychain_password = use_keychain and keychain_has(host)
+    if use_keychain_password and not interactive:
         env = askpass_env(host, env)
     else:
-        for var in ("SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "VNSSH_HOST"):
-            env.pop(var, None)
-        ssh_args.insert(1, "-tt")
-    return ssh_args, env, use_askpass
+        clear_askpass_env(env)
+        if interactive and "-tt" not in ssh_args:
+            ssh_args.insert(1, "-tt")
+    return ssh_args, env, use_keychain_password
 
 
 def run_ssh_session(
-    ssh_args: List[str], env: Dict[str, str], use_askpass: bool, exec_mode: bool
+    ssh_args: List[str],
+    env: Dict[str, str],
+    use_keychain_password: bool,
+    exec_mode: bool,
+    *,
+    host: str = "",
 ) -> ConnectResult:
     if exec_mode:
         os.execvpe("ssh", ssh_args, env)
     args = list(ssh_args)
-    session = ""
     run_env = dict(env)
-    if use_askpass:
-        session = uuid.uuid4().hex
-        run_env["VNSSH_ASKPASS_SESSION"] = session
-        cleanup_askpass_session(session)
-        if "-tt" not in args:
-            args.insert(1, "-tt")
-    try:
-        returncode, stderr = run_ssh_with_tty(args, run_env)
-    finally:
-        cleanup_askpass_session(session)
+    clear_askpass_env(run_env)
+    if use_keychain_password and host:
+        run_env["VNSSH_AUTO_PASSWORD_HOST"] = host
+    if "-tt" not in args:
+        args.insert(1, "-tt")
+    returncode, stderr = run_ssh_with_tty(args, run_env)
     return ConnectResult(returncode, stderr=stderr)
 
 
@@ -1614,21 +1667,27 @@ def connect_host(
         if not legacy and probe_algorithm_mismatch(host):
             persist_legacy_host(host)
             legacy = True
-        ssh_args, env, use_askpass = prepare_ssh_invocation(
-            host, legacy=legacy, use_keychain=use_keychain
+        ssh_args, env, use_keychain_password = prepare_ssh_invocation(
+            host, legacy=legacy, use_keychain=use_keychain, interactive=False
         )
-        run_ssh_session(ssh_args, env, use_askpass, exec_mode=True)
+        run_ssh_session(
+            ssh_args, env, use_keychain_password, exec_mode=True, host=host
+        )
 
-    ssh_args, env, use_askpass = prepare_ssh_invocation(
-        host, legacy=legacy, use_keychain=use_keychain
+    ssh_args, env, use_keychain_password = prepare_ssh_invocation(
+        host, legacy=legacy, use_keychain=use_keychain, interactive=True
     )
-    result = run_ssh_session(ssh_args, env, use_askpass, exec_mode=False)
+    result = run_ssh_session(
+        ssh_args, env, use_keychain_password, exec_mode=False, host=host
+    )
     if not legacy and ssh_algorithm_mismatch(result):
         persist_legacy_host(host)
-        ssh_args, env, use_askpass = prepare_ssh_invocation(
-            host, legacy=True, use_keychain=use_keychain
+        ssh_args, env, use_keychain_password = prepare_ssh_invocation(
+            host, legacy=True, use_keychain=use_keychain, interactive=True
         )
-        result = run_ssh_session(ssh_args, env, use_askpass, exec_mode=False)
+        result = run_ssh_session(
+            ssh_args, env, use_keychain_password, exec_mode=False, host=host
+        )
     return result
 
 
