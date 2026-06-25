@@ -218,6 +218,21 @@ def invalidate_keychain_cache() -> None:
     _KEYCHAIN_ACCOUNTS_CACHE = None
 
 
+def parse_keychain_acct(block: str) -> Optional[str]:
+    """Parse account name from a dump-keychain genp block."""
+    match = re.search(r'"acct"<blob>="([^"]+)"', block)
+    if match:
+        return match.group(1)
+
+    match = re.search(r'"acct"<blob>=0x([0-9A-Fa-f]+)', block)
+    if match:
+        try:
+            return bytes.fromhex(match.group(1)).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return None
+    return None
+
+
 def load_keychain_accounts() -> set[str]:
     """Load all vnssh Keychain account names in one dump (fast)."""
     global _KEYCHAIN_ACCOUNTS_CACHE
@@ -237,9 +252,9 @@ def load_keychain_accounts() -> set[str]:
             for block in re.split(r'class: "genp"', proc.stdout)[1:]:
                 if KEYCHAIN_SERVICE not in block:
                     continue
-                match = re.search(r'"acct"<blob>="([^"]+)"', block)
-                if match:
-                    accounts.add(match.group(1))
+                account = parse_keychain_acct(block)
+                if account:
+                    accounts.add(account)
 
     _KEYCHAIN_ACCOUNTS_CACHE = accounts
     return accounts
