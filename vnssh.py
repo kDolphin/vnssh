@@ -630,22 +630,48 @@ def format_host_block(data: WizardData) -> str:
     return "\n".join(lines) + "\n"
 
 
+def host_entry_to_wizard(host: str, opts: Dict[str, str], folder: str) -> WizardData:
+    identity = opts.get("identityfile", "")
+    return WizardData(
+        host=host,
+        hostname=opts.get("hostname", host),
+        user=opts.get("user", ""),
+        port=opts.get("port", str(DEFAULT_PORT)),
+        folder=folder,
+        auth=infer_auth({"identityfile": identity}, keychain_has(host)),
+        identity_file=identity or DEFAULT_IDENTITY,
+    )
+
+
+def format_parsed_host_block(host: str, opts: Dict[str, str], folder: str) -> str:
+    block = format_host_block(host_entry_to_wizard(host, opts, folder))
+    if opts.get("_vnssh_legacy") != "1":
+        return block
+    lines = block.splitlines()
+    if lines and lines[0].startswith(FOLDER_COMMENT_PREFIX):
+        lines.insert(1, LEGACY_COMMENT_PREFIX)
+    return "\n".join(lines) + "\n"
+
+
+def write_hosts_conf(
+    entries: List[Tuple[str, Dict[str, str], str]], path: Path = HOSTS_CONF
+) -> None:
+    ensure_vnssh_dir()
+    parts = ["# Managed by vnssh"]
+    for host, opts, folder in entries:
+        parts.append(format_parsed_host_block(host, opts, folder).rstrip())
+    path.write_text("\n".join(parts) + "\n", encoding="utf-8")
+
+
 def remove_host_block(host: str, path: Path = HOSTS_CONF) -> bool:
     text = read_config_text(path)
     if not text:
         return False
-    pattern = re.compile(
-        rf"(?:^{re.escape(FOLDER_COMMENT_PREFIX)}.*\n)?"
-        rf"^Host\s+{re.escape(host)}\s*$.*?(?=^{re.escape(FOLDER_COMMENT_PREFIX)}|^Host\s|\Z)",
-        re.MULTILINE | re.DOTALL,
-    )
-    new_text, count = pattern.subn("", text)
-    if count == 0:
+    entries = parse_config_entries(text)
+    filtered = [(h, opts, folder) for h, opts, folder in entries if h != host]
+    if len(filtered) == len(entries):
         return False
-    new_text = re.sub(r"\n{3,}", "\n\n", new_text).strip()
-    if new_text:
-        new_text += "\n"
-    path.write_text(new_text, encoding="utf-8")
+    write_hosts_conf(filtered, path)
     return True
 
 
