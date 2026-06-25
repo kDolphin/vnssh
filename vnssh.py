@@ -42,9 +42,19 @@ DEFAULT_PORT = 22
 DEFAULT_IDENTITY = "~/.ssh/id_ed25519"
 MIN_TERMINAL_HEIGHT = 14
 MIN_PAGE_SIZE = 3
-HELP_ACTIONS = "Enter connect  |  n new  |  e edit  |  d delete"
-HELP_NAV = "↑↓ select  |  PgUp/PgDn page  |  Esc clear/quit"
-STATUS_HINT = "n: new connection"
+HELP_HINTS: List[Tuple[str, str]] = [
+    ("Enter", "connect"),
+    ("n", "new"),
+    ("e", "edit"),
+    ("d", "delete"),
+    ("↑↓", "select"),
+    ("PgUp/PgDn", "page"),
+    ("Esc", "clear/quit"),
+]
+HELP_SPLIT_INDEX = 4
+HELP_SEGMENT_SEP = "  "
+STATUS_HINT_KEY = "n"
+STATUS_HINT_DESC = "new connection"
 
 AUTH_PASSWORD = "password"
 AUTH_KEY = "key"
@@ -883,6 +893,102 @@ def safe_addstr(win, y: int, x: int, text: str, attr: int = 0) -> None:
     win.addstr(y, x, text[:max_len], attr)
 
 
+def help_key_attr() -> int:
+    if curses.has_colors():
+        return curses.color_pair(2) | curses.A_BOLD
+    return curses.A_BOLD
+
+
+def help_desc_attr() -> int:
+    return curses.A_DIM
+
+
+def help_line_display_width(segments: List[Tuple[str, str]]) -> int:
+    if not segments:
+        return 0
+    sep_w = str_display_width(HELP_SEGMENT_SEP)
+    total = 0
+    for index, (keys, desc) in enumerate(segments):
+        if index:
+            total += sep_w
+        total += str_display_width(keys) + 1 + str_display_width(desc)
+    return total
+
+
+def help_lines_for_width(width: int) -> List[List[Tuple[str, str]]]:
+    inner = max(0, width - 2)
+    if help_line_display_width(HELP_HINTS) <= inner:
+        return [HELP_HINTS]
+
+    first = HELP_HINTS[:HELP_SPLIT_INDEX]
+    second = HELP_HINTS[HELP_SPLIT_INDEX:]
+    return [first, second]
+
+
+def draw_key_desc(
+    win,
+    row: int,
+    x: int,
+    key: str,
+    desc: str,
+    max_display_width: int,
+) -> int:
+    if max_display_width <= 0:
+        return x
+
+    desc_text = f" {desc}"
+    desc_w = str_display_width(desc_text)
+    key_w = str_display_width(key)
+    if key_w + desc_w > max_display_width:
+        clip = truncate_display(desc_text, max(0, max_display_width - key_w))
+        safe_addstr(win, row, x, key[: max(0, max_display_width)], help_key_attr())
+        if clip:
+            safe_addstr(win, row, x + len(key), clip, help_desc_attr())
+        return x + len(key) + len(clip)
+
+    safe_addstr(win, row, x, key, help_key_attr())
+    safe_addstr(win, row, x + len(key), desc_text, help_desc_attr())
+    return x + len(key) + len(desc_text)
+
+
+def draw_help_segments(
+    win,
+    row: int,
+    x: int,
+    segments: List[Tuple[str, str]],
+    max_display_width: int,
+) -> int:
+    if max_display_width <= 0:
+        return x
+
+    remaining = max_display_width
+    sep_w = str_display_width(HELP_SEGMENT_SEP)
+
+    for index, (keys, desc) in enumerate(segments):
+        if index:
+            if sep_w > remaining:
+                break
+            safe_addstr(win, row, x, HELP_SEGMENT_SEP, help_desc_attr())
+            x += len(HELP_SEGMENT_SEP)
+            remaining -= sep_w
+
+        keys_w = str_display_width(keys)
+        desc_w = str_display_width(desc) + 1
+        segment_w = keys_w + desc_w
+        if segment_w > remaining:
+            break
+
+        safe_addstr(win, row, x, keys, help_key_attr())
+        x += len(keys)
+        safe_addstr(win, row, x, " ", help_desc_attr())
+        x += 1
+        safe_addstr(win, row, x, desc, help_desc_attr())
+        x += len(desc)
+        remaining -= segment_w
+
+    return x
+
+
 def draw_box_title(win, title: str) -> None:
     height, width = win.getmaxyx()
     safe_addstr(win, 0, 2, f" {title} ", curses.A_BOLD)
@@ -1199,20 +1305,21 @@ class MainUI:
         self.reload_connections()
 
     def layout(self) -> Dict[str, int]:
-        height, _width = self.stdscr.getmaxyx()
-        help_nav_row = height - 1
-        help_actions_row = height - 2
-        input_row = height - 3
-        status_row = height - 4
-        footer_sep_row = height - 5
+        height, width = self.stdscr.getmaxyx()
+        help_rows = help_lines_for_width(width)
+        help_count = len(help_rows)
+        help_start = height - help_count
+        input_row = help_start - 1
+        status_row = input_row - 1
+        footer_sep_row = status_row - 1
         header_row = 1
         sep_row = 2
         list_start = 3
-        list_end = height - 6
+        list_end = footer_sep_row - 1
         page_size = max(MIN_PAGE_SIZE, list_end - list_start + 1)
         return {
-            "help_nav_row": help_nav_row,
-            "help_actions_row": help_actions_row,
+            "help_rows": list(range(help_start, height)),
+            "help_lines": help_rows,
             "input_row": input_row,
             "status_row": status_row,
             "footer_sep_row": footer_sep_row,
@@ -1361,20 +1468,20 @@ class MainUI:
 
     def draw_input_box(self, stdscr, layout: Dict[str, int], width: int) -> None:
         row = layout["input_row"]
-        label = "Search "
-        inner_w = max(0, width - 4 - len(label))
+        inner_w = max(0, width - 4)
         border = curses.A_DIM
         safe_addstr(stdscr, row, 1, "|", border)
         safe_addstr(stdscr, row, width - 2, "|", border)
-        safe_addstr(stdscr, row, 2, label, curses.A_DIM)
 
         if self.focus == "input":
-            attr = curses.color_pair(2) | curses.A_BOLD if curses.has_colors() else curses.A_BOLD
+            prefix_attr = help_key_attr()
+            query_attr = help_key_attr()
         else:
-            attr = curses.A_DIM
+            prefix_attr = help_desc_attr()
+            query_attr = help_desc_attr()
 
-        x = 2 + len(label)
-        safe_addstr(stdscr, row, x, SEARCH_PREFIX, attr)
+        x = 2
+        safe_addstr(stdscr, row, x, SEARCH_PREFIX, prefix_attr)
         x += len(SEARCH_PREFIX)
         if self.query:
             safe_addstr(
@@ -1382,14 +1489,14 @@ class MainUI:
                 row,
                 x,
                 self.query[: max(0, inner_w - len(SEARCH_PREFIX))],
-                attr,
+                query_attr,
             )
             x += len(self.query)
         if self.focus == "input" and self._blink_on and x < width - 2:
             cursor_char = "_" if not self.query else "|"
-            safe_addstr(stdscr, row, x, cursor_char, attr | curses.A_REVERSE)
+            safe_addstr(stdscr, row, x, cursor_char, query_attr | curses.A_REVERSE)
         elif not self.query and self.focus != "input":
-            safe_addstr(stdscr, row, x, "_", curses.A_DIM)
+            safe_addstr(stdscr, row, x, "_", help_desc_attr())
 
     def draw_status_bar(self, stdscr, layout: Dict[str, int], width: int) -> None:
         row = layout["status_row"]
@@ -1398,32 +1505,23 @@ class MainUI:
         status_x = max(1, width - 2 - len(status))
         safe_addstr(stdscr, row, status_x, status, status_attr)
 
-        if self.message:
-            left_text = self.message
-            left_attr = curses.color_pair(3)
-        else:
-            left_text = STATUS_HINT
-            left_attr = status_attr
-
         max_left = max(0, status_x - 2)
-        safe_addstr(stdscr, row, 1, left_text[:max_left], left_attr)
+        if self.message:
+            safe_addstr(stdscr, row, 1, self.message[:max_left], curses.color_pair(3))
+        else:
+            draw_key_desc(
+                stdscr,
+                row,
+                1,
+                STATUS_HINT_KEY,
+                STATUS_HINT_DESC,
+                max_left,
+            )
 
     def draw_help_lines(self, stdscr, layout: Dict[str, int], width: int) -> None:
         inner = max(0, width - 2)
-        safe_addstr(
-            stdscr,
-            layout["help_actions_row"],
-            1,
-            HELP_ACTIONS[:inner],
-            curses.A_DIM,
-        )
-        safe_addstr(
-            stdscr,
-            layout["help_nav_row"],
-            1,
-            HELP_NAV[:inner],
-            curses.A_DIM,
-        )
+        for row, segments in zip(layout["help_rows"], layout["help_lines"]):
+            draw_help_segments(stdscr, row, 1, segments, inner)
 
     def draw_footer(self, stdscr, layout: Dict[str, int], width: int) -> None:
         safe_addstr(
