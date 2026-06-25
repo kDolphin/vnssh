@@ -31,7 +31,6 @@ KEYCHAIN_SERVICE = "vnssh"
 INCLUDE_MARKER = "Include ~/.vnssh/hosts.conf"
 FOLDER_COMMENT_PREFIX = "#v-f:"
 LEGACY_COMMENT_PREFIX = "#v-legacy"
-LEGACY_HOST_MARKERS = ("路由器", "交换机", "2960", "3650", "带外")
 SSH_CONNECT_OPTIONS = (("StrictHostKeyChecking", "accept-new"),)
 LEGACY_SSH_OPTIONS = (
     (
@@ -622,9 +621,6 @@ def format_host_block(data: WizardData) -> str:
     if data.auth in (AUTH_KEY, AUTH_BOTH):
         identity = data.identity_file.strip() or DEFAULT_IDENTITY
         lines.append(f"    IdentityFile {identity}")
-    legacy_opts: Dict[str, str] = {}
-    if host_needs_legacy_ssh(data.host, legacy_opts):
-        lines.extend(legacy_ssh_config_lines())
     for key, value in SSH_CONNECT_OPTIONS:
         lines.append(f"    {key} {value}")
     return "\n".join(lines) + "\n"
@@ -785,7 +781,11 @@ def sorted_connections(connections: List[Connection], query: str) -> List[Connec
 
 
 def askpass_program() -> str:
-    """Absolute path used as SSH_ASKPASS (OpenSSH execs this directly)."""
+    """Absolute path used as SSH_ASKPASS (OpenSSH execs this file directly).
+
+    Uses __file__, so copying or renaming the script (e.g. to ~/bin/vnssh)
+    still works as long as the file is executable and has a python3 shebang.
+    """
     return str(Path(__file__).resolve())
 
 
@@ -829,19 +829,52 @@ def is_valid_ssh_host_argument(name: str) -> bool:
     return True
 
 
-def host_needs_legacy_ssh(host: str, opts: Dict[str, str]) -> bool:
-    if opts.get("_vnssh_legacy") == "1":
-        return True
-    return any(marker in host for marker in LEGACY_HOST_MARKERS)
+def host_legacy_enabled(host: str) -> bool:
+    raw = gather_raw_hosts()
+    entry = raw.get(host)
+    if not entry:
+        return False
+    return entry[0].get("_vnssh_legacy") == "1"
 
 
-def legacy_ssh_args(host: str, opts: Dict[str, str]) -> List[str]:
-    if not host_needs_legacy_ssh(host, opts):
-        return []
+def legacy_ssh_option_args() -> List[str]:
     args: List[str] = []
     for key, value in LEGACY_SSH_OPTIONS:
         args.extend(["-o", f"{key}={value}"])
     return args
+
+
+def ssh_algorithm_mismatch(result: ConnectResult) -> bool:
+    err = (result.stderr or "").lower()
+    phrases = (
+        "no matching key exchange method found",
+        "no matching cipher found",
+        "no matching mac found",
+        "no matching host key type found",
+    )
+    return any(phrase in err for phrase in phrases)
+
+
+def persist_legacy_host(host: str) -> None:
+    """Remember a host needs legacy SSH options after auto-detection."""
+    if not HOSTS_CONF.exists():
+        return
+    text = read_config_text(HOSTS_CONF)
+    legacy_prefix = f"{LEGACY_COMMENT_PREFIX}\nHost {host}"
+    if legacy_prefix in text:
+        return
+    pattern = rf"^Host\s+{re.escape(host)}\s*$"
+    if not re.search(pattern, text, re.MULTILINE):
+        return
+    new_text = re.sub(
+        pattern,
+        f"{LEGACY_COMMENT_PREFIX}\nHost {host}",
+        text,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    HOSTS_CONF.write_text(new_text, encoding="utf-8")
+    ensure_legacy_ip_stanzas()
 
 
 def legacy_ssh_config_lines() -> List[str]:
@@ -879,7 +912,7 @@ def ensure_legacy_ip_stanzas() -> None:
     additions: List[str] = []
 
     for host_name, opts, folder in parse_config_entries(text):
-        if not host_needs_legacy_ssh(host_name, opts):
+        if opts.get("_vnssh_legacy") != "1":
             continue
         hostname = opts.get("hostname", "").strip()
         if not hostname or not re.fullmatch(r"[0-9.]+", hostname):
@@ -955,13 +988,14 @@ def format_connect_error(host: str, result: ConnectResult) -> str:
     return f"{host}: connection closed"
 
 
-def build_ssh_argv(host: str) -> List[str]:
+def build_ssh_argv(host: str, *, legacy: Optional[bool] = None) -> List[str]:
     args = ["ssh"]
     for key, value in SSH_CONNECT_OPTIONS:
         args.extend(["-o", f"{key}={value}"])
     raw = gather_raw_hosts()
     entry = raw.get(host)
     opts = entry[0] if entry else {}
+    use_legacy = legacy if legacy is not None else opts.get("_vnssh_legacy") == "1"
     mode = connection_auth_mode(host)
     if mode == AUTH_PASSWORD and keychain_has(host):
         args.extend(
@@ -972,19 +1006,18 @@ def build_ssh_argv(host: str) -> List[str]:
                 "PubkeyAuthentication=no",
             ]
         )
-    args.extend(legacy_ssh_args(host, opts))
+    if use_legacy:
+        args.extend(legacy_ssh_option_args())
     target, extra = resolve_ssh_endpoint(host)
     args.extend(extra)
     args.append(target)
     return args
 
 
-def connect_host(
-    host: str, use_keychain: bool = True, exec_mode: bool = True
+def run_ssh_subprocess(
+    host: str, use_keychain: bool = True, *, legacy: bool = False
 ) -> ConnectResult:
-    """Run ssh. exec_mode=True replaces process (CLI); TUI captures errors."""
-    record_use(host)
-    ssh_args = build_ssh_argv(host)
+    ssh_args = build_ssh_argv(host, legacy=legacy)
     env = os.environ.copy()
     use_askpass = use_keychain and keychain_has(host)
     if use_askpass:
@@ -994,23 +1027,58 @@ def connect_host(
         env["DISPLAY"] = env.get("DISPLAY", ":0")
         target = ssh_args[-1]
         ssh_args = ssh_args[:-1] + askpass_ssh_options() + [target]
-        if exec_mode:
-            os.execvpe("ssh", ssh_args, env)
-        proc = subprocess.run(
-            ssh_args,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
-        return ConnectResult(proc.returncode, proc.stderr, proc.stdout)
-    if exec_mode:
-        os.execvp("ssh", ssh_args)
     proc = subprocess.run(
         ssh_args,
+        env=env,
         capture_output=True,
         text=True,
     )
     return ConnectResult(proc.returncode, proc.stderr, proc.stdout)
+
+
+def connect_host(
+    host: str, use_keychain: bool = True, exec_mode: bool = True
+) -> ConnectResult:
+    """Run ssh. exec_mode=True replaces process (CLI); TUI captures errors."""
+    record_use(host)
+    legacy = host_legacy_enabled(host)
+
+    if not legacy:
+        probe = run_ssh_subprocess(host, use_keychain, legacy=False)
+        if ssh_algorithm_mismatch(probe):
+            persist_legacy_host(host)
+            legacy = True
+        elif exec_mode:
+            ssh_args = build_ssh_argv(host, legacy=False)
+            env = os.environ.copy()
+            if use_keychain and keychain_has(host):
+                env["VNSSH_HOST"] = host
+                env["SSH_ASKPASS"] = askpass_program()
+                env["SSH_ASKPASS_REQUIRE"] = "force"
+                env["DISPLAY"] = env.get("DISPLAY", ":0")
+                target = ssh_args[-1]
+                ssh_args = ssh_args[:-1] + askpass_ssh_options() + [target]
+                os.execvpe("ssh", ssh_args, env)
+            os.execvp("ssh", ssh_args)
+
+    if exec_mode:
+        ssh_args = build_ssh_argv(host, legacy=legacy)
+        env = os.environ.copy()
+        if use_keychain and keychain_has(host):
+            env["VNSSH_HOST"] = host
+            env["SSH_ASKPASS"] = askpass_program()
+            env["SSH_ASKPASS_REQUIRE"] = "force"
+            env["DISPLAY"] = env.get("DISPLAY", ":0")
+            target = ssh_args[-1]
+            ssh_args = ssh_args[:-1] + askpass_ssh_options() + [target]
+            os.execvpe("ssh", ssh_args, env)
+        os.execvp("ssh", ssh_args)
+
+    result = run_ssh_subprocess(host, use_keychain, legacy=legacy)
+    if not legacy and ssh_algorithm_mismatch(result):
+        persist_legacy_host(host)
+        result = run_ssh_subprocess(host, use_keychain, legacy=True)
+    return result
 
 
 def apply_keychain_password(host: str, password: str) -> None:
