@@ -769,6 +769,46 @@ def connection_auth_mode(host: str) -> str:
     return infer_auth({"identityfile": opts.get("identityfile", "")}, has_pw)
 
 
+def is_valid_ssh_host_argument(name: str) -> bool:
+    """OpenSSH rejects non-ASCII and some punctuation in the hostname argument."""
+    if not name:
+        return False
+    for char in name:
+        if char in ".-_:":
+            continue
+        code = ord(char)
+        if 48 <= code <= 57 or 65 <= code <= 90 or 97 <= code <= 122:
+            continue
+        return False
+    return True
+
+
+def resolve_ssh_endpoint(host: str) -> Tuple[str, List[str]]:
+    """Map a config Host alias to an ssh target and extra CLI args."""
+    raw = gather_raw_hosts()
+    entry = raw.get(host)
+    if not entry:
+        return host, []
+
+    opts, _, _ = entry
+    hostname, user, port = resolve_connection_fields(host, opts)
+    extra: List[str] = []
+    if port != DEFAULT_PORT:
+        extra.extend(["-p", str(port)])
+    identity = opts.get("identityfile")
+    if identity:
+        extra.extend(["-i", os.path.expanduser(identity)])
+
+    if is_valid_ssh_host_argument(host):
+        return host, extra
+
+    if hostname:
+        target = f"{user}@{hostname}" if user else hostname
+        return target, extra
+
+    return host, extra
+
+
 def build_ssh_argv(host: str) -> List[str]:
     args = ["ssh"]
     mode = connection_auth_mode(host)
@@ -781,7 +821,9 @@ def build_ssh_argv(host: str) -> List[str]:
                 "PubkeyAuthentication=no",
             ]
         )
-    args.append(host)
+    target, extra = resolve_ssh_endpoint(host)
+    args.extend(extra)
+    args.append(target)
     return args
 
 
