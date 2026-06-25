@@ -42,10 +42,9 @@ DEFAULT_PORT = 22
 DEFAULT_IDENTITY = "~/.ssh/id_ed25519"
 MIN_TERMINAL_HEIGHT = 14
 MIN_PAGE_SIZE = 3
-HELP_TEXT = (
-    "Up/Down select Enter connect n new e edit d del "
-    "PgUp/Dn/C-f/C-b page Esc clear/quit"
-)
+HELP_ACTIONS = "Enter connect  |  n new  |  e edit  |  d delete"
+HELP_NAV = "↑↓ select  |  PgUp/PgDn page  |  Esc clear/quit"
+STATUS_HINT = "n: new connection"
 
 AUTH_PASSWORD = "password"
 AUTH_KEY = "key"
@@ -1201,20 +1200,22 @@ class MainUI:
 
     def layout(self) -> Dict[str, int]:
         height, _width = self.stdscr.getmaxyx()
-        help_row = height - 1
-        input_row = height - 2
-        new_row = height - 3
+        help_nav_row = height - 1
+        help_actions_row = height - 2
+        input_row = height - 3
         status_row = height - 4
+        footer_sep_row = height - 5
         header_row = 1
         sep_row = 2
         list_start = 3
-        list_end = height - 5
+        list_end = height - 6
         page_size = max(MIN_PAGE_SIZE, list_end - list_start + 1)
         return {
-            "help_row": help_row,
+            "help_nav_row": help_nav_row,
+            "help_actions_row": help_actions_row,
             "input_row": input_row,
-            "new_row": new_row,
             "status_row": status_row,
+            "footer_sep_row": footer_sep_row,
             "header_row": header_row,
             "sep_row": sep_row,
             "list_start": list_start,
@@ -1360,27 +1361,81 @@ class MainUI:
 
     def draw_input_box(self, stdscr, layout: Dict[str, int], width: int) -> None:
         row = layout["input_row"]
-        inner_w = max(0, width - 4)
+        label = "Search "
+        inner_w = max(0, width - 4 - len(label))
         border = curses.A_DIM
         safe_addstr(stdscr, row, 1, "|", border)
         safe_addstr(stdscr, row, width - 2, "|", border)
+        safe_addstr(stdscr, row, 2, label, curses.A_DIM)
 
         if self.focus == "input":
             attr = curses.color_pair(2) | curses.A_BOLD if curses.has_colors() else curses.A_BOLD
         else:
             attr = curses.A_DIM
 
-        x = 2
+        x = 2 + len(label)
         safe_addstr(stdscr, row, x, SEARCH_PREFIX, attr)
         x += len(SEARCH_PREFIX)
         if self.query:
-            safe_addstr(stdscr, row, x, self.query[: max(0, inner_w - len(SEARCH_PREFIX))], attr)
+            safe_addstr(
+                stdscr,
+                row,
+                x,
+                self.query[: max(0, inner_w - len(SEARCH_PREFIX))],
+                attr,
+            )
             x += len(self.query)
         if self.focus == "input" and self._blink_on and x < width - 2:
             cursor_char = "_" if not self.query else "|"
             safe_addstr(stdscr, row, x, cursor_char, attr | curses.A_REVERSE)
         elif not self.query and self.focus != "input":
             safe_addstr(stdscr, row, x, "_", curses.A_DIM)
+
+    def draw_status_bar(self, stdscr, layout: Dict[str, int], width: int) -> None:
+        row = layout["status_row"]
+        status = self.status_text(layout)
+        status_attr = curses.A_DIM
+        status_x = max(1, width - 2 - len(status))
+        safe_addstr(stdscr, row, status_x, status, status_attr)
+
+        if self.message:
+            left_text = self.message
+            left_attr = curses.color_pair(3)
+        else:
+            left_text = STATUS_HINT
+            left_attr = status_attr
+
+        max_left = max(0, status_x - 2)
+        safe_addstr(stdscr, row, 1, left_text[:max_left], left_attr)
+
+    def draw_help_lines(self, stdscr, layout: Dict[str, int], width: int) -> None:
+        inner = max(0, width - 2)
+        safe_addstr(
+            stdscr,
+            layout["help_actions_row"],
+            1,
+            HELP_ACTIONS[:inner],
+            curses.A_DIM,
+        )
+        safe_addstr(
+            stdscr,
+            layout["help_nav_row"],
+            1,
+            HELP_NAV[:inner],
+            curses.A_DIM,
+        )
+
+    def draw_footer(self, stdscr, layout: Dict[str, int], width: int) -> None:
+        safe_addstr(
+            stdscr,
+            layout["footer_sep_row"],
+            1,
+            ("-" * max(0, width - 2))[: max(0, width - 2)],
+            curses.A_DIM,
+        )
+        self.draw_status_bar(stdscr, layout, width)
+        self.draw_input_box(stdscr, layout, width)
+        self.draw_help_lines(stdscr, layout, width)
 
     def draw(self) -> None:
         stdscr = self.stdscr
@@ -1408,41 +1463,7 @@ class MainUI:
             selected = self.focus == "list" and idx == self.list_cursor
             self.draw_connection_row(stdscr, row, width, conn, selected)
 
-        status = self.status_text(layout)
-        safe_addstr(
-            stdscr,
-            layout["status_row"],
-            1,
-            status.rjust(max(0, width - 2))[: max(0, width - 2)],
-            curses.A_DIM,
-        )
-
-        new_attr = curses.A_BOLD if curses.has_colors() else curses.A_BOLD
-        safe_addstr(
-            stdscr,
-            layout["new_row"],
-            1,
-            "+ New SSH connection  (n)"[: max(0, width - 2)],
-            new_attr,
-        )
-
-        self.draw_input_box(stdscr, layout, width)
-
-        safe_addstr(
-            stdscr,
-            layout["help_row"],
-            1,
-            HELP_TEXT[: max(0, width - 2)],
-            curses.A_DIM,
-        )
-        if self.message:
-            safe_addstr(
-                stdscr,
-                layout["status_row"],
-                1,
-                self.message[: max(0, width - len(status) - 4)],
-                curses.color_pair(3),
-            )
+        self.draw_footer(stdscr, layout, width)
 
         stdscr.refresh()
 
@@ -1489,6 +1510,8 @@ class MainUI:
         self.reload_connections()
 
     def handle_input_key(self, ch: int, char: Optional[str]) -> Optional[str]:
+        if ch not in (-1,):
+            self.message = ""
         if ch in (8, 127, curses.KEY_BACKSPACE):
             self.query = self.query[:-1]
             self.apply_filter(reset_scroll=True)
@@ -1525,6 +1548,8 @@ class MainUI:
         return None
 
     def handle_list_key(self, ch: int, char: Optional[str]) -> Optional[str]:
+        if ch not in (-1,):
+            self.message = ""
         if ch in (curses.KEY_UP,):
             self.move_list(-1)
             return None
@@ -1558,7 +1583,6 @@ class MainUI:
     def run(self) -> None:
         ensure_include()
         while True:
-            self.message = ""
             self.draw()
             if self.focus == "input":
                 self.stdscr.timeout(SEARCH_CURSOR_BLINK_MS)
@@ -1582,16 +1606,20 @@ class MainUI:
             if action is None:
                 continue
             if action == "new":
+                self.message = ""
                 self.open_new_wizard()
             elif action == "connect_one":
+                self.message = ""
                 self.connect_selected(self.filtered[0])
             elif action == "connect":
                 conn = self.selected_connection()
                 if conn:
+                    self.message = ""
                     self.connect_selected(conn)
             elif action == "edit":
                 conn = self.selected_connection()
                 if conn:
+                    self.message = ""
                     wizard_edit(self.stdscr, conn)
                     self.reload_connections()
                 else:
@@ -1599,6 +1627,7 @@ class MainUI:
             elif action == "delete":
                 conn = self.selected_connection()
                 if conn:
+                    self.message = ""
                     if delete_connection(self.stdscr, conn):
                         self.reload_connections()
                 else:
