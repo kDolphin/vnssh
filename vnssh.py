@@ -30,7 +30,8 @@ SSH_CONFIG = Path.home() / ".ssh" / "config"
 KEYCHAIN_SERVICE = "vnssh"
 INCLUDE_MARKER = "Include ~/.vnssh/hosts.conf"
 FOLDER_COMMENT_PREFIX = "#v-f:"
-FOLDER_UNCATEGORIZED = "未分类"
+FOLDER_UNCATEGORIZED = "Uncategorized"
+FOLDER_UNCATEGORIZED_ALIASES = frozenset({FOLDER_UNCATEGORIZED, "未分类"})
 COL_FOLDER_W = 12
 COL_HOST_W = 16
 COL_FLAGS_W = 9
@@ -41,16 +42,19 @@ DEFAULT_PORT = 22
 DEFAULT_IDENTITY = "~/.ssh/id_ed25519"
 MIN_TERMINAL_HEIGHT = 14
 MIN_PAGE_SIZE = 3
-HELP_TEXT = "↑↓选 Enter连 n新建 e编 d删 PgUp/Dn/C-f/C-b翻 Esc清/退"
+HELP_TEXT = (
+    "Up/Down select Enter connect n new e edit d del "
+    "PgUp/Dn/C-f/C-b page Esc clear/quit"
+)
 
 AUTH_PASSWORD = "password"
 AUTH_KEY = "key"
 AUTH_BOTH = "both"
 
 AUTH_LABELS = {
-    AUTH_PASSWORD: "密码登录",
-    AUTH_KEY: "SSH 密钥",
-    AUTH_BOTH: "密码 + 密钥",
+    AUTH_PASSWORD: "Password",
+    AUTH_KEY: "SSH key",
+    AUTH_BOTH: "Password + key",
 }
 
 IMPORT_COLUMNS = {
@@ -102,7 +106,7 @@ class Connection:
 
     @property
     def folder_display(self) -> str:
-        return self.folder or FOLDER_UNCATEGORIZED
+        return normalize_folder(self.folder)
 
     @property
     def label(self) -> str:
@@ -171,7 +175,7 @@ def keychain_set(account: str, password: str) -> None:
         text=True,
     )
     if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.strip() or "无法写入 Keychain")
+        raise RuntimeError(proc.stderr.strip() or "Failed to write Keychain")
     invalidate_keychain_cache()
 
 
@@ -318,9 +322,16 @@ def parse_folder_comment(line: str) -> Optional[str]:
     return None
 
 
+def is_uncategorized_folder(folder: str) -> bool:
+    value = folder.strip()
+    return not value or value in FOLDER_UNCATEGORIZED_ALIASES
+
+
 def normalize_folder(folder: str) -> str:
     value = folder.strip()
-    return value if value else FOLDER_UNCATEGORIZED
+    if is_uncategorized_folder(value):
+        return FOLDER_UNCATEGORIZED
+    return value
 
 
 def parse_config_entries(text: str) -> List[Tuple[str, Dict[str, str], str]]:
@@ -764,7 +775,7 @@ def connect_host(host: str, use_keychain: bool = True, exec_mode: bool = True) -
 
 
 def apply_keychain_password(host: str, password: str) -> None:
-    """有密码就写入 Keychain；留空则删除已有条目。"""
+    """Write password to Keychain when set; delete entry when empty."""
     if password:
         keychain_set(host, password)
     else:
@@ -962,18 +973,18 @@ def read_line_input(
 # ---------------------------------------------------------------------------
 
 WIZARD_FIELDS_FULL = [
-    ("host", "名字 (Host): ", False),
-    ("folder", "分组 (留空=未分类): ", False),
-    ("hostname", "地址 (IP/域名): ", False),
-    ("port", f"端口 [{DEFAULT_PORT}]: ", False),
-    ("user", "帐号 (User): ", False),
-    ("auth", "认证方式 [1密码 2密钥 3两者]: ", False),
-    ("identity_file", "密钥路径: ", False),
-    ("password", "登录密码 (可留空): ", True),
+    ("host", "Name (Host): ", False),
+    ("folder", "Folder (empty=Uncategorized): ", False),
+    ("hostname", "Address (IP/domain): ", False),
+    ("port", f"Port [{DEFAULT_PORT}]: ", False),
+    ("user", "User: ", False),
+    ("auth", "Auth [1=password 2=key 3=both]: ", False),
+    ("identity_file", "Key path: ", False),
+    ("password", "Password (optional): ", True),
 ]
 
 WIZARD_FIELDS_PASSWORD_ONLY = [
-    ("password", "登录密码 (留空删除): ", True),
+    ("password", "Password (empty=delete): ", True),
 ]
 
 
@@ -990,7 +1001,7 @@ def wizard_field_initial(key: str, data: WizardData) -> str:
         return {"password": "1", "key": "2", "both": "3"}.get(data.auth, "1")
     if key == "folder":
         folder = str(getattr(data, "folder", ""))
-        return "" if folder in ("", FOLDER_UNCATEGORIZED) else folder
+        return "" if is_uncategorized_folder(folder) else folder
     return str(getattr(data, key, ""))
 
 
@@ -998,14 +1009,14 @@ def apply_wizard_field(key: str, data: WizardData, value: str) -> Optional[str]:
     if key == "host":
         value = value.strip()
         if not value:
-            return "名字不能为空"
+            return "Name cannot be empty"
         data.host = value
     elif key == "folder":
         data.folder = value.strip()
     elif key == "hostname":
         data.hostname = value.strip()
         if not data.hostname:
-            return "地址不能为空"
+            return "Address cannot be empty"
     elif key == "port":
         data.port = value.strip() or str(DEFAULT_PORT)
     elif key == "user":
@@ -1037,9 +1048,9 @@ def run_wizard(
         draw_box_title(stdscr, title)
         safe_addstr(stdscr, 2, 2, label, curses.A_BOLD)
         if key == "auth":
-            safe_addstr(stdscr, 3, 4, "1=密码  2=密钥  3=密码+密钥", curses.A_DIM)
+            safe_addstr(stdscr, 3, 4, "1=password  2=key  3=password+key", curses.A_DIM)
         if key == "password" and data.auth != AUTH_KEY:
-            hint = "输入即保存到 Keychain；留空则删除已有密码，连接时手动输入"
+            hint = "Saved to Keychain; empty removes stored password (enter at connect)"
             safe_addstr(stdscr, 3, 4, hint, curses.A_DIM)
 
         initial = wizard_field_initial(key, data)
@@ -1059,7 +1070,7 @@ def run_wizard(
         if data.host in raw:
             stdscr.clear()
             draw_box_title(stdscr, title)
-            safe_addstr(stdscr, 3, 4, f"Host '{data.host}' 已存在", curses.color_pair(4))
+            safe_addstr(stdscr, 3, 4, f"Host '{data.host}' already exists", curses.color_pair(4))
             stdscr.refresh()
             stdscr.getch()
             return None
@@ -1069,9 +1080,9 @@ def run_wizard(
 
 def wizard_new(stdscr) -> Optional[WizardData]:
     stdscr.clear()
-    draw_box_title(stdscr, "新建 SSH 连接")
+    draw_box_title(stdscr, "New SSH connection")
     data = WizardData()
-    result = run_wizard(stdscr, "新建 SSH 连接", data, WIZARD_FIELDS_FULL)
+    result = run_wizard(stdscr, "New SSH connection", data, WIZARD_FIELDS_FULL)
     if result is None:
         return None
     upsert_host_block(result)
@@ -1085,7 +1096,7 @@ def wizard_new(stdscr) -> Optional[WizardData]:
 def wizard_edit(stdscr, conn: Connection) -> Optional[WizardData]:
     stdscr.clear()
     if conn.managed:
-        draw_box_title(stdscr, f"编辑 {conn.host}")
+        draw_box_title(stdscr, f"Edit {conn.host}")
         data = WizardData(
             host=conn.host,
             folder=conn.folder_display,
@@ -1097,7 +1108,7 @@ def wizard_edit(stdscr, conn: Connection) -> Optional[WizardData]:
             password=keychain_get(conn.host) or "",
             original_host=conn.host,
         )
-        result = run_wizard(stdscr, "编辑", data, WIZARD_FIELDS_FULL)
+        result = run_wizard(stdscr, "Edit", data, WIZARD_FIELDS_FULL)
         if result is None:
             return None
         upsert_host_block(result)
@@ -1107,14 +1118,20 @@ def wizard_edit(stdscr, conn: Connection) -> Optional[WizardData]:
             keychain_delete(result.host)
         return result
 
-    draw_box_title(stdscr, f"编辑 {conn.host} [ext]")
-    safe_addstr(stdscr, 2, 2, "外部 config 条目：仅可修改 Keychain 密码。", curses.color_pair(3))
+    draw_box_title(stdscr, f"Edit {conn.host} [ext]")
+    safe_addstr(
+        stdscr,
+        2,
+        2,
+        "External config entry: Keychain password only.",
+        curses.color_pair(3),
+    )
     data = WizardData(
         host=conn.host,
         password=keychain_get(conn.host) or "",
         original_host=conn.host,
     )
-    result = run_wizard(stdscr, "编辑密码", data, WIZARD_FIELDS_PASSWORD_ONLY)
+    result = run_wizard(stdscr, "Edit password", data, WIZARD_FIELDS_PASSWORD_ONLY)
     if result is None:
         return None
     apply_keychain_password(result.host, result.password)
@@ -1123,28 +1140,29 @@ def wizard_edit(stdscr, conn: Connection) -> Optional[WizardData]:
 
 def delete_connection(stdscr, conn: Connection) -> bool:
     stdscr.clear()
-    draw_box_title(stdscr, "删除连接")
+    draw_box_title(stdscr, "Delete connection")
+    confirm_prompt = "Confirm [y/N]"
     lines = [
-        f"删除 {conn.host} ?",
+        f"Delete {conn.host}?",
         "",
-        "将删除:",
+        "Will remove:",
     ]
     if conn.managed:
-        lines.append("  - ~/.vnssh/hosts.conf 中的配置")
+        lines.append("  - Entry in ~/.vnssh/hosts.conf")
     else:
-        lines.append("  - (保留 ~/.ssh/config 中的配置)")
+        lines.append("  - (Keeps entry in ~/.ssh/config)")
     if conn.has_password:
-        lines.append("  - Keychain 密码")
-    lines.append("  - 使用记录")
+        lines.append("  - Keychain password")
+    lines.append("  - Usage history")
     lines.append("")
-    lines.append("确认 [y/N]")
+    lines.append(confirm_prompt)
 
     for i, line in enumerate(lines):
         attr = curses.color_pair(4) if i == 0 and curses.has_colors() else 0
         safe_addstr(stdscr, 2 + i, 2, line, attr)
 
     confirm_y = 2 + len(lines) - 1
-    stdscr.move(confirm_y, 2 + len("确认 [y/N]"))
+    stdscr.move(confirm_y, 2 + len(confirm_prompt))
     stdscr.refresh()
     while True:
         ch = stdscr.getch()
@@ -1277,28 +1295,28 @@ class MainUI:
             stdscr,
             1,
             cols["folder_x"],
-            pad_display("分组", cols["folder_w"]),
+            pad_display("Folder", cols["folder_w"]),
             attr,
         )
         safe_addstr(
             stdscr,
             1,
             cols["host_x"],
-            pad_display("名称", cols["host_w"]),
+            pad_display("Name", cols["host_w"]),
             attr,
         )
         safe_addstr(
             stdscr,
             1,
             cols["addr_x"],
-            pad_display("地址", cols["addr_w"]),
+            pad_display("Address", cols["addr_w"]),
             attr,
         )
         safe_addstr(
             stdscr,
             1,
             cols["flags_x"],
-            pad_display("标记", cols["flags_w"], "right"),
+            pad_display("Flags", cols["flags_w"], "right"),
             attr,
         )
 
@@ -1404,7 +1422,7 @@ class MainUI:
             stdscr,
             layout["new_row"],
             1,
-            "+ 新建 SSH 连接  (n)"[: max(0, width - 2)],
+            "+ New SSH connection  (n)"[: max(0, width - 2)],
             new_attr,
         )
 
@@ -1577,14 +1595,14 @@ class MainUI:
                     wizard_edit(self.stdscr, conn)
                     self.reload_connections()
                 else:
-                    self.message = "请选择一条连接再编辑"
+                    self.message = "Select a connection to edit"
             elif action == "delete":
                 conn = self.selected_connection()
                 if conn:
                     if delete_connection(self.stdscr, conn):
                         self.reload_connections()
                 else:
-                    self.message = "请选择一条连接再删除"
+                    self.message = "Select a connection to delete"
 
 
 def main_curses(stdscr) -> None:
@@ -1595,14 +1613,14 @@ def main_curses(stdscr) -> None:
     stdscr.nodelay(False)
     height, width = stdscr.getmaxyx()
     if height < MIN_TERMINAL_HEIGHT or width < 40:
-        raise SystemExit("终端窗口太小，请放大后重试。")
+        raise SystemExit("Terminal too small; enlarge the window and retry.")
     MainUI(stdscr).run()
 
 
 def cmd_init() -> None:
     ensure_include()
-    print(f"已初始化 {VNSSH_DIR}")
-    print(f"已确保 {SSH_CONFIG} 包含: {INCLUDE_MARKER}")
+    print(f"Initialized {VNSSH_DIR}")
+    print(f"Ensured {SSH_CONFIG} includes: {INCLUDE_MARKER}")
 
 
 def cmd_list() -> None:
@@ -1661,11 +1679,11 @@ def row_to_wizard(row: Dict[str, str]) -> WizardData:
     hostname = row.get("hostname", "").strip()
     user = row.get("user", "").strip()
     if not host:
-        raise ValueError("缺少 host（连接名）")
+        raise ValueError("missing host (connection name)")
     if not hostname:
-        raise ValueError(f"{host}: 缺少 hostname（地址）")
+        raise ValueError(f"{host}: missing hostname (address)")
     if not user:
-        raise ValueError(f"{host}: 缺少 user（帐号）")
+        raise ValueError(f"{host}: missing user")
 
     port = row.get("port", "").strip() or str(DEFAULT_PORT)
     password = row.get("password", "")
@@ -1738,7 +1756,7 @@ def read_import_csv(path: Path) -> List[WizardData]:
     with path.open(newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
         if not reader.fieldnames:
-            raise ValueError("CSV 缺少表头行")
+            raise ValueError("CSV is missing a header row")
 
         rows: List[WizardData] = []
         for line_no, raw in enumerate(reader, start=2):
@@ -1748,7 +1766,7 @@ def read_import_csv(path: Path) -> List[WizardData]:
             try:
                 rows.append(row_to_wizard(canonical))
             except ValueError as exc:
-                raise ValueError(f"第 {line_no} 行: {exc}") from exc
+                raise ValueError(f"Line {line_no}: {exc}") from exc
         return rows
 
 
@@ -1759,23 +1777,23 @@ def cmd_import(argv: List[str]) -> None:
 
     if len(paths) != 1:
         print(
-            "用法: vnssh import [--dry-run] [--force] <file.csv>\n"
+            "Usage: vnssh import [--dry-run] [--force] <file.csv>\n"
             "\n"
-            "CSV 表头（中英文均可）:\n"
+            "CSV headers (English or Chinese accepted):\n"
             "  host, folder, hostname, user, port, password, identity_file, auth\n"
             "\n"
-            "规则:\n"
-            "  - 新 Host → 写入 ~/.vnssh/hosts.conf + Keychain\n"
-            "  - 已存在于 ~/.ssh/config [ext] → 仅导入 password 到 Keychain\n"
-            "  - 已存在于 hosts.conf → 默认跳过；--force 覆盖配置与密码\n"
+            "Rules:\n"
+            "  - New Host -> write ~/.vnssh/hosts.conf + Keychain\n"
+            "  - Existing in ~/.ssh/config [ext] -> import password to Keychain only\n"
+            "  - Existing in hosts.conf -> skip by default; --force overwrites config and password\n"
             "\n"
-            "auth 取值: password / key / both（或 1 / 2 / 3）"
+            "auth values: password / key / both (or 1 / 2 / 3)"
         )
         sys.exit(1)
 
     csv_path = Path(paths[0]).expanduser()
     if not csv_path.exists():
-        print(f"文件不存在: {csv_path}")
+        print(f"File not found: {csv_path}")
         sys.exit(1)
 
     ensure_include()
@@ -1797,21 +1815,24 @@ def cmd_import(argv: List[str]) -> None:
         stats[action] = stats.get(action, 0) + 1
 
         if action == "add":
-            print(f"{prefix}新增 {data.host} -> {data.user}@{data.hostname}")
+            print(f"{prefix}Added {data.host} -> {data.user}@{data.hostname}")
         elif action == "update_managed":
-            print(f"{prefix}覆盖 {data.host}")
+            print(f"{prefix}Updated {data.host}")
         elif action == "keychain_ext":
-            print(f"{prefix}仅 Keychain [ext] {data.host}")
+            print(f"{prefix}Keychain only [ext] {data.host}")
         elif action == "skip_managed":
-            print(f"{prefix}跳过（已存在于 hosts.conf）: {data.host}（可用 --force 覆盖）")
+            print(
+                f"{prefix}Skipped (exists in hosts.conf): {data.host} "
+                f"(use --force to overwrite)"
+            )
         elif action == "skip_ext":
-            print(f"{prefix}跳过 [ext] {data.host}（无 password 列）")
+            print(f"{prefix}Skipped [ext] {data.host} (no password column)")
 
     print(
-        f"\n{prefix}完成: 新增 {stats['add']}, "
-        f"覆盖 {stats['update_managed']}, "
+        f"\n{prefix}Done: added {stats['add']}, "
+        f"updated {stats['update_managed']}, "
         f"Keychain [ext] {stats['keychain_ext']}, "
-        f"跳过 {stats['skip_managed'] + stats['skip_ext']}"
+        f"skipped {stats['skip_managed'] + stats['skip_ext']}"
     )
 
 
@@ -1839,7 +1860,7 @@ def main() -> None:
             cmd_import(sys.argv[2:])
             return
         print(
-            "用法: vnssh | vnssh init | vnssh list | vnssh connect <Host> | "
+            "Usage: vnssh | vnssh init | vnssh list | vnssh connect <Host> | "
             "vnssh import [--dry-run] [--force] <file.csv>"
         )
         sys.exit(1)
