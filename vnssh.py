@@ -1139,6 +1139,63 @@ def connect_failure_snippet(err: str) -> str:
     return "\n".join(kept[-3:])
 
 
+def identity_key_error(err: str, host: str) -> Optional[str]:
+    """Detect OpenSSH private-key file permission/path errors in full stderr."""
+    if not err:
+        return None
+    lower = err.lower()
+    markers = (
+        "unprotected private key file",
+        "are too open",
+        "bad permissions",
+        "private key will be ignored",
+        "identity file",
+        "not accessible",
+        "load key",
+    )
+    if not any(marker in lower for marker in markers):
+        return None
+
+    key_path = ""
+    for line in err.splitlines():
+        text = line.strip()
+        match = re.search(
+            r"Permissions \d+ for '([^']+)' are too open", text, re.IGNORECASE
+        )
+        if match:
+            key_path = match.group(1)
+            break
+        match = re.search(r'Load key "([^"]+)": bad permissions', text, re.IGNORECASE)
+        if match:
+            key_path = match.group(1)
+            break
+        match = re.search(r"Identity file ([^ ]+) not accessible", text, re.IGNORECASE)
+        if match:
+            key_path = match.group(1)
+            break
+
+    if not key_path:
+        entry = gather_raw_hosts().get(host)
+        if entry:
+            key_path = entry[0].get("identityfile", "")
+
+    if key_path:
+        key_path = os.path.expanduser(key_path)
+        if "not accessible" in lower and "too open" not in lower:
+            return (
+                f"{host}: private key not found or not readable ({key_path}); "
+                f"check path and run: chmod 600 '{key_path}'"
+            )
+        return (
+            f"{host}: private key permissions too open ({key_path}); "
+            f"run: chmod 600 '{key_path}'"
+        )
+    return (
+        f"{host}: private key file permissions too open or not accessible; "
+        f"run: chmod 600 <key.pem>"
+    )
+
+
 def should_report_connect_error(result: ConnectResult) -> bool:
     """Only surface status-bar errors for real failures, not normal SSH logout."""
     if result.returncode == 0:
@@ -1152,9 +1209,19 @@ def should_report_connect_error(result: ConnectResult) -> bool:
 
 
 def format_connect_error(host: str, result: ConnectResult) -> str:
-    err = connect_failure_snippet((result.stderr or "").strip())
+    full_err = (result.stderr or "").strip()
+    key_err = identity_key_error(full_err, host)
+    if key_err:
+        return key_err
+    err = connect_failure_snippet(full_err)
 
     if "Permission denied" in err:
+        mode = connection_auth_mode(host)
+        if mode == AUTH_KEY:
+            return (
+                f"{host}: authentication failed "
+                f"(check private key path, permissions, or key itself)"
+            )
         if not keychain_has(host):
             return f"{host}: authentication failed (no saved password; press e to store)"
         return f"{host}: authentication failed (check password or key)"
