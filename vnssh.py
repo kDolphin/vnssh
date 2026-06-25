@@ -2470,6 +2470,22 @@ def import_wizard_data(data: WizardData, force: bool = False, dry_run: bool = Fa
     return "add"
 
 
+def sync_folders_from_csv(rows: List[WizardData]) -> int:
+    """Align hosts.conf folder tags with CSV without changing other host fields."""
+    folder_by_host = {data.host: normalize_folder(data.folder) for data in rows}
+    entries = parse_config_entries(read_config_text(HOSTS_CONF))
+    updated = 0
+    new_entries: List[Tuple[str, Dict[str, str], str]] = []
+    for host, opts, folder in entries:
+        new_folder = folder_by_host.get(host, folder)
+        if new_folder != folder:
+            updated += 1
+        new_entries.append((host, opts, new_folder))
+    if updated:
+        write_hosts_conf(new_entries)
+    return updated
+
+
 def read_import_csv(path: Path) -> List[WizardData]:
     with path.open(newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
@@ -2516,6 +2532,11 @@ def cmd_import(argv: List[str]) -> None:
 
     ensure_include()
     rows = read_import_csv(csv_path)
+
+    if force and not dry_run:
+        fixed = sync_folders_from_csv(rows)
+        if fixed:
+            print(f"Synced folder tags for {fixed} host(s) from CSV")
 
     stats = {
         "add": 0,
