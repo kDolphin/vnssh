@@ -966,55 +966,8 @@ def askpass_env(host: str, base: Optional[Dict[str, str]] = None) -> Dict[str, s
     return env
 
 
-def known_hosts_ports(hostname: str) -> List[int]:
-    """Ports previously used for hostname according to ~/.ssh/known_hosts."""
-    path = Path.home() / ".ssh" / "known_hosts"
-    if not path.exists() or not hostname:
-        return []
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return []
-    ports: List[int] = []
-    seen: set[int] = set()
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        bracket = re.match(rf"^\[{re.escape(hostname)}\]:(\d+)\s", line)
-        if bracket:
-            port = int(bracket.group(1))
-        elif re.match(rf"^{re.escape(hostname)}\s", line):
-            port = DEFAULT_PORT
-        else:
-            continue
-        if port not in seen:
-            seen.add(port)
-            ports.append(port)
-    return ports
-
-
-def connect_error_port_hint(host: str) -> str:
-    raw = gather_raw_hosts()
-    entry = raw.get(host)
-    if not entry:
-        return ""
-    hostname, _, port = resolve_connection_fields(host, entry[0])
-    if not hostname:
-        return ""
-    others = [p for p in known_hosts_ports(hostname) if p != port]
-    if not others:
-        return ""
-    if len(others) == 1:
-        return f"try port {others[0]}"
-    joined = ", ".join(str(p) for p in others)
-    return f"known_hosts lists ports {joined}"
-
-
 def format_connect_error(host: str, result: ConnectResult) -> str:
     err = (result.stderr or "").strip()
-    port_hint = connect_error_port_hint(host)
-    port_suffix = f"; {port_hint}" if port_hint else ""
 
     if "Permission denied" in err:
         if not keychain_has(host):
@@ -1028,14 +981,14 @@ def format_connect_error(host: str, result: ConnectResult) -> str:
         return f"{host}: hostname could not be resolved"
     for phrase in ("Connection refused", "Operation timed out", "Connection timed out"):
         if phrase in err:
-            return f"{host}: {phrase.lower()}{port_suffix}"
+            return f"{host}: {phrase.lower()} (try another port or check VPN)"
     if "Connection closed by" in err or "kex_exchange_identification" in err:
         return (
             f"{host}: server closed connection "
-            f"(not a password issue; check port/VPN/firewall{port_suffix})"
+            f"(try another port, or check VPN/firewall)"
         )
     if "Connection reset" in err or "Broken pipe" in err:
-        return f"{host}: network connection dropped (check VPN or port{port_suffix})"
+        return f"{host}: network connection dropped (try another port or check VPN)"
     for line in reversed(err.splitlines()):
         text = line.strip()
         if not text or text.startswith("Warning:"):
@@ -1046,7 +999,7 @@ def format_connect_error(host: str, result: ConnectResult) -> str:
             continue
         return f"{host}: {text[:100]}"
     if result.returncode != 0:
-        return f"{host}: connection failed (check port, VPN, or network{port_suffix})"
+        return f"{host}: connection failed (try another port, or check VPN/network)"
     return f"{host}: connection closed"
 
 
