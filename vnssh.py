@@ -32,6 +32,7 @@ INCLUDE_MARKER = "Include ~/.vnssh/hosts.conf"
 FOLDER_COMMENT_PREFIX = "#v-f:"
 LEGACY_COMMENT_PREFIX = "#v-legacy"
 LEGACY_HOST_MARKERS = ("路由器", "交换机", "2960", "3650", "带外")
+SSH_CONNECT_OPTIONS = (("StrictHostKeyChecking", "accept-new"),)
 LEGACY_SSH_OPTIONS = (
     (
         "KexAlgorithms",
@@ -617,6 +618,8 @@ def format_host_block(data: WizardData) -> str:
     legacy_opts: Dict[str, str] = {}
     if host_needs_legacy_ssh(data.host, legacy_opts):
         lines.extend(legacy_ssh_config_lines())
+    for key, value in SSH_CONNECT_OPTIONS:
+        lines.append(f"    {key} {value}")
     return "\n".join(lines) + "\n"
 
 
@@ -855,6 +858,8 @@ def format_legacy_ip_stanza(hostname: str, opts: Dict[str, str]) -> str:
     if identity:
         lines.append(f"    IdentityFile {identity}")
     lines.extend(legacy_ssh_config_lines())
+    for key, value in SSH_CONNECT_OPTIONS:
+        lines.append(f"    {key} {value}")
     return "\n".join(lines) + "\n"
 
 
@@ -910,6 +915,8 @@ def resolve_ssh_endpoint(host: str) -> Tuple[str, List[str]]:
 
 def build_ssh_argv(host: str) -> List[str]:
     args = ["ssh"]
+    for key, value in SSH_CONNECT_OPTIONS:
+        args.extend(["-o", f"{key}={value}"])
     raw = gather_raw_hosts()
     entry = raw.get(host)
     opts = entry[0] if entry else {}
