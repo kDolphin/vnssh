@@ -1136,7 +1136,59 @@ def connect_failure_snippet(err: str) -> str:
     kept = [line for line in lines if not is_ssh_noise_line(line)]
     if not kept:
         return err.strip()
+    for line in reversed(kept):
+        if line.lower().startswith("received disconnect from"):
+            return line
     return "\n".join(kept[-3:])
+
+
+_SSH_DISCONNECT_REASON = re.compile(
+    r"^Received disconnect from .+ port \d+:\d+:\s*(.+?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def ssh_disconnect_reason(err: str) -> Optional[str]:
+    for line in err.splitlines():
+        match = _SSH_DISCONNECT_REASON.match(line.strip())
+        if match:
+            return match.group(1).strip()
+    return None
+
+
+def password_expired_error(err: str, host: str) -> Optional[str]:
+    if not err:
+        return None
+    compact = err.lower().replace(" ", "").replace("_", "")
+    if "passwordexpired" in compact or "passwordhasexpired" in compact:
+        return f"{host}: password expired (reset on bastion portal or contact admin)"
+    lower = err.lower()
+    if "password expired" in lower or "password has expired" in lower:
+        return f"{host}: password expired (reset on bastion portal or contact admin)"
+    if "密码过期" in err or "密码已过期" in err:
+        return f"{host}: password expired (reset on bastion portal or contact admin)"
+    reason = ssh_disconnect_reason(err)
+    if reason and "passwordexpired" in reason.lower().replace(" ", ""):
+        return f"{host}: password expired (reset on bastion portal or contact admin)"
+    return None
+
+
+def ssh_disconnect_error(err: str, host: str) -> Optional[str]:
+    expired = password_expired_error(err, host)
+    if expired:
+        return expired
+    reason = ssh_disconnect_reason(err)
+    if not reason:
+        return None
+    lower = reason.lower()
+    if lower == "authentication failed":
+        return (
+            f"{host}: authentication failed "
+            f"(wrong password, or password expired on bastion)"
+        )
+    if lower == "too many authentication failures":
+        return f"{host}: too many authentication failures"
+    return f"{host}: {reason}"
 
 
 def identity_key_error(err: str, host: str) -> Optional[str]:
@@ -1213,6 +1265,9 @@ def format_connect_error(host: str, result: ConnectResult) -> str:
     key_err = identity_key_error(full_err, host)
     if key_err:
         return key_err
+    disconnect_err = ssh_disconnect_error(full_err, host)
+    if disconnect_err:
+        return disconnect_err
     err = connect_failure_snippet(full_err)
 
     if "Permission denied" in err:
@@ -1248,6 +1303,10 @@ def format_connect_error(host: str, result: ConnectResult) -> str:
         if "Pseudo-terminal will not be allocated" in text:
             continue
         if "post-quantum key exchange" in text:
+            continue
+        if text.lower().startswith("received disconnect from"):
+            continue
+        if is_disconnect_line(text):
             continue
         return f"{host}: {text[:100]}"
     if result.returncode != 0:
