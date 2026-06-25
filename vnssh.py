@@ -24,7 +24,7 @@ import time
 import tty
 import unicodedata
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -1973,6 +1973,149 @@ def begin_session_log(host: str) -> Optional[Path]:
     return allocate_session_log_path(host, datetime.now().astimezone())
 
 
+SESSION_ARCHIVE_STATE_FILE = SESSIONS_DIR / ".archive-state.json"
+_SESSION_FILE_DATE_RE = re.compile(r"_(\d{4}-\d{2}-\d{2})_\d{6}(?:_\d+)?\.session$")
+
+
+def session_archive_enabled() -> bool:
+    token = os.environ.get("VNSSH_SESSION_ARCHIVE", "1").strip().lower()
+    return token not in ("0", "false", "no", "off")
+
+
+def session_file_date(path: Path) -> Optional[date]:
+    match = _SESSION_FILE_DATE_RE.search(path.name)
+    if not match:
+        return None
+    try:
+        return date.fromisoformat(match.group(1))
+    except ValueError:
+        return None
+
+
+def week_label_for(day: date) -> str:
+    monday = day - timedelta(days=day.weekday())
+    sunday = monday + timedelta(days=6)
+    return f"{monday.isoformat()}_{sunday.isoformat()}"
+
+
+def current_week_monday() -> date:
+    today = datetime.now().astimezone().date()
+    return today - timedelta(days=today.weekday())
+
+
+def load_session_archive_state() -> set[str]:
+    if not SESSION_ARCHIVE_STATE_FILE.exists():
+        return set()
+    try:
+        payload = json.loads(
+            SESSION_ARCHIVE_STATE_FILE.read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        return set()
+    weeks = payload.get("archived_weeks", [])
+    if not isinstance(weeks, list):
+        return set()
+    return {str(item) for item in weeks}
+
+
+def save_session_archive_state(archived_weeks: set[str]) -> None:
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {"archived_weeks": sorted(archived_weeks)}
+    SESSION_ARCHIVE_STATE_FILE.write_text(
+        json.dumps(payload, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def find_pending_session_archive_weeks() -> List[str]:
+    """Return sorted week labels (Mon_Sun) before the current week needing archive."""
+    if not session_archive_enabled() or not SESSIONS_DIR.exists():
+        return []
+    archived = load_session_archive_state()
+    current_monday = current_week_monday()
+    pending: set[str] = set()
+    for path in SESSIONS_DIR.glob("*.session"):
+        file_date = session_file_date(path)
+        if file_date is None:
+            continue
+        week_monday = file_date - timedelta(days=file_date.weekday())
+        if week_monday >= current_monday:
+            continue
+        label = week_label_for(file_date)
+        if label not in archived:
+            pending.add(label)
+    return sorted(pending)
+
+
+def list_session_files_for_week_label(week_label: str) -> List[Path]:
+    files: List[Path] = []
+    for path in SESSIONS_DIR.glob("*.session"):
+        file_date = session_file_date(path)
+        if file_date is None:
+            continue
+        if week_label_for(file_date) == week_label:
+            files.append(path)
+    return sorted(files)
+
+
+def archive_session_week(week_label: str, files: List[Path]) -> bool:
+    if not files:
+        return True
+    archive_path = SESSIONS_DIR / f"{week_label}.tar.gz"
+    tmp_path = SESSIONS_DIR / f"{week_label}.tar.gz.tmp"
+    tmp_path.unlink(missing_ok=True)
+    names = [path.name for path in files]
+    try:
+        subprocess.run(
+            ["tar", "-czf", str(tmp_path), "-C", str(SESSIONS_DIR), *names],
+            check=True,
+            capture_output=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        tmp_path.unlink(missing_ok=True)
+        return False
+    try:
+        archive_path.unlink(missing_ok=True)
+        tmp_path.replace(archive_path)
+        for path in files:
+            path.unlink()
+    except OSError:
+        tmp_path.unlink(missing_ok=True)
+        return False
+    return True
+
+
+def archive_pending_session_weeks(week_labels: List[str]) -> None:
+    """Pack prior-week session logs on TUI exit; delete sources after success."""
+    if not session_archive_enabled() or not week_labels:
+        return
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    archived = load_session_archive_state()
+    for week_label in week_labels:
+        if week_label in archived:
+            continue
+        files = list_session_files_for_week_label(week_label)
+        if not files:
+            archived.add(week_label)
+            save_session_archive_state(archived)
+            continue
+        print(f"Archiving sessions {week_label}...", file=sys.stderr, flush=True)
+        if archive_session_week(week_label, files):
+            archived.add(week_label)
+            save_session_archive_state(archived)
+            print(
+                f"Archived {len(files)} session(s) -> {week_label}.tar.gz",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            print(
+                f"Failed to archive sessions {week_label}; will retry next run",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
 def run_ssh_with_tty(
     argv: List[str],
     env: Dict[str, str],
@@ -3404,7 +3547,11 @@ def main_curses(stdscr) -> None:
     height, width = stdscr.getmaxyx()
     if height < MIN_TERMINAL_HEIGHT or width < 40:
         raise SystemExit("Terminal too small; enlarge the window and retry.")
-    MainUI(stdscr).run()
+    pending_session_archives = find_pending_session_archive_weeks()
+    try:
+        MainUI(stdscr).run()
+    finally:
+        archive_pending_session_weeks(pending_session_archives)
 
 
 def import_template_path() -> Path:
