@@ -1704,7 +1704,7 @@ _AUTH_FAILURE_MARKERS = (
 _AUTO_PASSWORD_DELAY = 0.45
 _SESSION_LOG_READY_DELAY = 0.4
 _RECENT_OUTPUT_WINDOW = 16384
-_LOG_FLUSH_BYTES = 4096
+_LOG_FLUSH_BYTES = 1024
 _LOG_FLUSH_INTERVAL = 0.05
 
 _SSH_CLIENT_MARKERS = (
@@ -2078,6 +2078,7 @@ def run_ssh_with_tty(
         ):
             return
         log_file.write(log_write_buffer)
+        log_file.flush()
         log_write_buffer.clear()
         last_log_flush = now
 
@@ -2108,7 +2109,7 @@ def run_ssh_with_tty(
         nonlocal last_log_flush
         finalize_session_log_file(sanitize=True)
         try:
-            log_file = path.open("ab", buffering=1024 * 1024)
+            log_file = path.open("ab", buffering=0)
         except OSError:
             return False
         active_transcript_path = path
