@@ -153,6 +153,13 @@ class Connection:
 
 
 @dataclass
+class ConnectResult:
+    returncode: int
+    stderr: str = ""
+    stdout: str = ""
+
+
+@dataclass
 class WizardData:
     host: str = ""
     hostname: str = ""
@@ -913,6 +920,41 @@ def resolve_ssh_endpoint(host: str) -> Tuple[str, List[str]]:
     return host, extra
 
 
+def askpass_ssh_options() -> List[str]:
+    """Fail fast when Keychain password is wrong; never wait on a TTY prompt."""
+    return [
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "NumberOfPasswordPrompts=1",
+    ]
+
+
+def format_connect_error(host: str, result: ConnectResult) -> str:
+    err = (result.stderr or "").strip()
+    if "Permission denied" in err:
+        return f"{host}: authentication failed (check password or key)"
+    if "no matching key exchange" in err:
+        return f"{host}: SSH algorithm mismatch"
+    if "Host key verification failed" in err:
+        return f"{host}: host key verification failed"
+    if "Could not resolve hostname" in err:
+        return f"{host}: hostname could not be resolved"
+    for phrase in ("Connection refused", "Operation timed out", "Connection timed out"):
+        if phrase in err:
+            return f"{host}: {phrase.lower()}"
+    for line in reversed(err.splitlines()):
+        text = line.strip()
+        if not text or text.startswith("Warning:"):
+            continue
+        if "Pseudo-terminal will not be allocated" in text:
+            continue
+        return f"{host}: {text[:100]}"
+    if result.returncode != 0:
+        return f"{host}: connection failed (exit {result.returncode})"
+    return f"{host}: connection closed"
+
+
 def build_ssh_argv(host: str) -> List[str]:
     args = ["ssh"]
     for key, value in SSH_CONNECT_OPTIONS:
@@ -937,22 +979,38 @@ def build_ssh_argv(host: str) -> List[str]:
     return args
 
 
-def connect_host(host: str, use_keychain: bool = True, exec_mode: bool = True) -> int:
-    """Run ssh. exec_mode=True replaces process (CLI); False returns exit code (TUI)."""
+def connect_host(
+    host: str, use_keychain: bool = True, exec_mode: bool = True
+) -> ConnectResult:
+    """Run ssh. exec_mode=True replaces process (CLI); TUI captures errors."""
     record_use(host)
     ssh_args = build_ssh_argv(host)
     env = os.environ.copy()
-    if use_keychain and keychain_has(host):
+    use_askpass = use_keychain and keychain_has(host)
+    if use_askpass:
         env["VNSSH_HOST"] = host
         env["SSH_ASKPASS"] = askpass_program()
         env["SSH_ASKPASS_REQUIRE"] = "force"
         env["DISPLAY"] = env.get("DISPLAY", ":0")
+        target = ssh_args[-1]
+        ssh_args = ssh_args[:-1] + askpass_ssh_options() + [target]
         if exec_mode:
             os.execvpe("ssh", ssh_args, env)
-        return subprocess.call(ssh_args, env=env)
+        proc = subprocess.run(
+            ssh_args,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        return ConnectResult(proc.returncode, proc.stderr, proc.stdout)
     if exec_mode:
         os.execvp("ssh", ssh_args)
-    return subprocess.call(ssh_args)
+    proc = subprocess.run(
+        ssh_args,
+        capture_output=True,
+        text=True,
+    )
+    return ConnectResult(proc.returncode, proc.stderr, proc.stdout)
 
 
 def apply_keychain_password(host: str, password: str) -> None:
@@ -1834,8 +1892,12 @@ class MainUI:
 
     def connect_selected(self, conn: Connection) -> None:
         curses.endwin()
-        connect_host(conn.host, exec_mode=False)
+        result = connect_host(conn.host, exec_mode=False)
         self.resume_after_ssh()
+        if result.returncode != 0:
+            self.message = format_connect_error(conn.host, result)
+        elif "closed" in (result.stderr or "").lower():
+            self.message = format_connect_error(conn.host, result)
 
     def open_new_wizard(self) -> None:
         wizard_new(self.stdscr)
