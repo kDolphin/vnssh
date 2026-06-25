@@ -61,8 +61,10 @@ vnssh list
 vnssh connect <Host名>
 vnssh import hosts.csv
 vnssh import --dry-run file.csv
-vnssh init          # 可选；与首次运行效果相同，仅多打印确认信息
+vnssh init          # 初始化 ~/.vnssh，并在当前目录生成导入模板 CSV
 ```
+
+`vnssh init` 会在**当前目录**生成 `vnssh-hosts-template.csv`（已存在则跳过）。编辑后执行 `vnssh import vnssh-hosts-template.csv` 即可导入。
 
 ## 配置文件
 
@@ -94,7 +96,15 @@ Host bastion-example
 
 ## CSV 导入
 
-表头使用英文列名：`host`, `hostname`, `user`, `port`, `password`, `folder`, `auth`。
+在当前目录生成模板：
+
+```bash
+vnssh init
+# 生成 vnssh-hosts-template.csv（含示例行）
+vnssh import vnssh-hosts-template.csv
+```
+
+列名：`host`, `folder`, `hostname`, `user`, `port`, `password`, `identity_file`, `auth`。
 
 `auth` 取值：`password` / `key` / `both`（或 `1` / `2` / `3`）。
 

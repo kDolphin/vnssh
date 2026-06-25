@@ -104,6 +104,8 @@ AUTH_LABELS = {
     AUTH_BOTH: "Password + key",
 }
 
+IMPORT_TEMPLATE_FILENAME = "vnssh-hosts-template.csv"
+
 IMPORT_COLUMNS = {
     "host": ("host", "name", "alias", "session_name"),
     "folder": ("folder", "group", "category"),
@@ -3386,10 +3388,53 @@ def main_curses(stdscr) -> None:
     MainUI(stdscr).run()
 
 
+def import_template_path() -> Path:
+    return Path.cwd() / IMPORT_TEMPLATE_FILENAME
+
+
+def write_import_template(path: Path) -> bool:
+    """Write a sample CSV import template; return False if path already exists."""
+    if path.exists():
+        return False
+    fieldnames = list(IMPORT_COLUMNS.keys())
+    rows = [
+        {
+            "host": "prod-web",
+            "folder": "Production",
+            "hostname": "203.0.113.10",
+            "user": "alice",
+            "port": "22",
+            "password": "",
+            "identity_file": "",
+            "auth": "password",
+        },
+        {
+            "host": "dev-app",
+            "folder": "Development",
+            "hostname": "10.0.0.5",
+            "user": "deploy",
+            "port": "22",
+            "password": "",
+            "identity_file": "~/.ssh/id_ed25519",
+            "auth": "key",
+        },
+    ]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    return True
+
+
 def cmd_init() -> None:
     ensure_include()
     print(f"Initialized {VNSSH_DIR}")
     print(f"Ensured {SSH_CONFIG} includes: {INCLUDE_MARKER}")
+    template = import_template_path()
+    if write_import_template(template):
+        print(f"Wrote import template: {template}")
+    else:
+        print(f"Import template already exists: {template}")
 
 
 def cmd_list() -> None:
@@ -3605,8 +3650,10 @@ def cmd_import(argv: List[str]) -> None:
         print(
             "Usage: vnssh import [--dry-run] [--force] <file.csv>\n"
             "\n"
-            "CSV headers (English or Chinese accepted):\n"
+            "CSV headers:\n"
             "  host, folder, hostname, user, port, password, identity_file, auth\n"
+            "\n"
+            f"Run `vnssh init` to create {IMPORT_TEMPLATE_FILENAME} in the current directory.\n"
             "\n"
             "Rules:\n"
             "  - New Host -> write ~/.vnssh/hosts.conf + Keychain\n"
