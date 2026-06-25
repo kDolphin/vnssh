@@ -49,13 +49,11 @@ HELP_HINTS: List[Tuple[str, str]] = [
     ("e", "edit"),
     ("d", "delete"),
     ("↑↓", "select"),
-    ("PgUp/PgDn", "page"),
+    ("PgUp/PgDn C-b/C-f", "page"),
     ("Esc", "clear/quit"),
 ]
 HELP_SPLIT_INDEX = 4
 HELP_SEGMENT_SEP = "  "
-STATUS_HINT_KEY = "C-n"
-STATUS_HINT_DESC = "new connection"
 
 AUTH_PASSWORD = "password"
 AUTH_KEY = "key"
@@ -1536,18 +1534,9 @@ class MainUI:
         status_x = max(1, width - 2 - len(status))
         safe_addstr(stdscr, row, status_x, status, status_attr)
 
-        max_left = max(0, status_x - 2)
         if self.message:
+            max_left = max(0, status_x - 2)
             safe_addstr(stdscr, row, 1, self.message[:max_left], curses.color_pair(3))
-        else:
-            draw_key_desc(
-                stdscr,
-                row,
-                1,
-                STATUS_HINT_KEY,
-                STATUS_HINT_DESC,
-                max_left,
-            )
 
     def draw_help_lines(self, stdscr, layout: Dict[str, int], width: int) -> None:
         inner = max(0, width - 2)
