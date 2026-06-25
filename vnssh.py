@@ -1174,6 +1174,20 @@ def open_controlling_tty() -> Optional[int]:
         return None
 
 
+def clear_terminal_screen() -> None:
+    """Erase physical terminal content left by SSH (incl. alternate screen)."""
+    try:
+        fd = os.open("/dev/tty", os.O_WRONLY)
+    except OSError:
+        return
+    try:
+        os.write(fd, b"\033[?1049l\033[2J\033[H")
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def prepare_terminal_for_shell() -> None:
     """Restore canonical terminal mode after curses endwin()."""
     tty_fd = open_controlling_tty()
@@ -1960,14 +1974,16 @@ class MainUI:
         self.clamp_scroll()
 
     def resume_after_ssh(self) -> None:
+        clear_terminal_screen()
         curses.reset_prog_mode()
         curses.cbreak()
         self.stdscr.keypad(True)
         curses.set_escdelay(25)
         init_colors()
-        self.stdscr.refresh()
+        self.stdscr.clear()
         self.focus_input()
         self.reload_connections()
+        self.draw()
 
     def status_text(self, layout: Dict[str, int]) -> str:
         total = len(self.filtered)
@@ -2191,6 +2207,7 @@ class MainUI:
             self.focus_input()
 
     def connect_selected(self, conn: Connection) -> None:
+        self.message = ""
         curses.def_prog_mode()
         curses.endwin()
         prepare_terminal_for_shell()
@@ -2198,6 +2215,7 @@ class MainUI:
         self.resume_after_ssh()
         if result.returncode != 0:
             self.message = format_connect_error(conn.host, result)
+            self.draw()
 
     def open_new_wizard(self) -> None:
         wizard_new(self.stdscr)
