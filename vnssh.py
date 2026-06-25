@@ -586,6 +586,7 @@ def ensure_vnssh_dir() -> None:
 
 def ensure_include() -> None:
     ensure_vnssh_dir()
+    ensure_legacy_ip_stanzas()
     ssh_dir = SSH_CONFIG.parent
     ssh_dir.mkdir(parents=True, exist_ok=True)
     text = read_config_text(SSH_CONFIG)
@@ -613,6 +614,9 @@ def format_host_block(data: WizardData) -> str:
     if data.auth in (AUTH_KEY, AUTH_BOTH):
         identity = data.identity_file.strip() or DEFAULT_IDENTITY
         lines.append(f"    IdentityFile {identity}")
+    legacy_opts: Dict[str, str] = {}
+    if host_needs_legacy_ssh(data.host, legacy_opts):
+        lines.extend(legacy_ssh_config_lines())
     return "\n".join(lines) + "\n"
 
 
@@ -828,6 +832,54 @@ def legacy_ssh_args(host: str, opts: Dict[str, str]) -> List[str]:
     for key, value in LEGACY_SSH_OPTIONS:
         args.extend(["-o", f"{key}={value}"])
     return args
+
+
+def legacy_ssh_config_lines() -> List[str]:
+    return [f"    {key} {value}" for key, value in LEGACY_SSH_OPTIONS]
+
+
+def format_legacy_ip_stanza(hostname: str, opts: Dict[str, str]) -> str:
+    """OpenSSH Host block keyed by IP for plain `ssh user@ip` matching."""
+    lines = [f"Host {hostname}", f"    HostName {hostname}"]
+    user = opts.get("user", "")
+    if user:
+        lines.append(f"    User {user}")
+    port_str = opts.get("port", str(DEFAULT_PORT))
+    try:
+        port = int(port_str)
+    except ValueError:
+        port = DEFAULT_PORT
+    if port != DEFAULT_PORT:
+        lines.append(f"    Port {port}")
+    identity = opts.get("identityfile")
+    if identity:
+        lines.append(f"    IdentityFile {identity}")
+    lines.extend(legacy_ssh_config_lines())
+    return "\n".join(lines) + "\n"
+
+
+def ensure_legacy_ip_stanzas() -> None:
+    """Ensure legacy network devices have Host <IP> stanzas in hosts.conf."""
+    if not HOSTS_CONF.exists():
+        return
+    text = read_config_text(HOSTS_CONF)
+    managed = HOSTS_CONF.resolve()
+    additions: List[str] = []
+
+    for host_name, opts, folder in parse_config_entries(text):
+        if not host_needs_legacy_ssh(host_name, opts):
+            continue
+        hostname = opts.get("hostname", "").strip()
+        if not hostname or not re.fullmatch(r"[0-9.]+", hostname):
+            continue
+        if re.search(rf"^Host\s+{re.escape(hostname)}\s*$", text, re.MULTILINE):
+            continue
+        additions.append(format_legacy_ip_stanza(hostname, opts))
+
+    if additions:
+        if text and not text.endswith("\n"):
+            text += "\n"
+        HOSTS_CONF.write_text(text + "".join(additions), encoding="utf-8")
 
 
 def resolve_ssh_endpoint(host: str) -> Tuple[str, List[str]]:
