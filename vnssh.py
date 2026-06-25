@@ -42,9 +42,10 @@ DEFAULT_PORT = 22
 DEFAULT_IDENTITY = "~/.ssh/id_ed25519"
 MIN_TERMINAL_HEIGHT = 16
 MIN_PAGE_SIZE = 3
+KEY_CTRL_N = 14
 HELP_HINTS: List[Tuple[str, str]] = [
     ("Enter", "connect"),
-    ("n", "new"),
+    ("C-n", "new"),
     ("e", "edit"),
     ("d", "delete"),
     ("↑↓", "select"),
@@ -53,7 +54,7 @@ HELP_HINTS: List[Tuple[str, str]] = [
 ]
 HELP_SPLIT_INDEX = 4
 HELP_SEGMENT_SEP = "  "
-STATUS_HINT_KEY = "n"
+STATUS_HINT_KEY = "C-n"
 STATUS_HINT_DESC = "new connection"
 
 AUTH_PASSWORD = "password"
@@ -1661,7 +1662,7 @@ class MainUI:
         if ch in (curses.KEY_NPAGE, 6):  # PgDn, Ctrl-F
             self.page_scroll(1)
             return None
-        if ch in (ord("n"), ord("N")):
+        if ch == KEY_CTRL_N:
             return "new"
         if ch in (10, 13, curses.KEY_ENTER):
             if len(self.filtered) == 1:
@@ -1693,7 +1694,7 @@ class MainUI:
         if ch == 27:
             self.focus_input()
             return None
-        if ch in (ord("n"), ord("N")):
+        if ch == KEY_CTRL_N:
             return "new"
         if ch in (ord("e"), ord("E")):
             return "edit"
