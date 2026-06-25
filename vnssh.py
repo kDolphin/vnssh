@@ -13,6 +13,7 @@ import re
 import shlex
 import subprocess
 import sys
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,14 +31,17 @@ KEYCHAIN_SERVICE = "vnssh"
 INCLUDE_MARKER = "Include ~/.vnssh/hosts.conf"
 FOLDER_COMMENT_PREFIX = "#v-f:"
 FOLDER_UNCATEGORIZED = "未分类"
-FOLDER_COL_WIDTH = 10
+COL_FOLDER_W = 12
+COL_HOST_W = 16
+COL_FLAGS_W = 6
+COL_PREFIX_W = 2
 SEARCH_PREFIX = "/ "
 SEARCH_CURSOR_BLINK_MS = 500
 BADGE_KEYCHAIN = "[P]"
 BADGE_IDENTITY = "[k]"
 DEFAULT_PORT = 22
 DEFAULT_IDENTITY = "~/.ssh/id_ed25519"
-MIN_TERMINAL_HEIGHT = 12
+MIN_TERMINAL_HEIGHT = 14
 MIN_PAGE_SIZE = 3
 HELP_TEXT = "↑↓选 Enter连 n新建 e编 d删 PgUp/Dn/C-f/C-b翻 Esc清/退"
 
@@ -791,6 +795,84 @@ def init_colors() -> None:
     curses.init_pair(4, curses.COLOR_RED, -1)  # danger
 
 
+def char_display_width(char: str) -> int:
+    if len(char) != 1:
+        return 0
+    if unicodedata.east_asian_width(char) in ("F", "W"):
+        return 2
+    return 1
+
+
+def str_display_width(text: str) -> int:
+    return sum(char_display_width(c) for c in text)
+
+
+def truncate_display(text: str, max_width: int) -> str:
+    if max_width <= 0:
+        return ""
+    if str_display_width(text) <= max_width:
+        return text
+    ellipsis = "…"
+    ell_w = str_display_width(ellipsis)
+    out: List[str] = []
+    width = 0
+    for char in text:
+        char_w = char_display_width(char)
+        if width + char_w > max_width - ell_w:
+            break
+        out.append(char)
+        width += char_w
+    return "".join(out) + ellipsis
+
+
+def pad_display(text: str, width: int, align: str = "left") -> str:
+    clipped = truncate_display(text, width)
+    pad = max(0, width - str_display_width(clipped))
+    if align == "right":
+        return " " * pad + clipped
+    return clipped + " " * pad
+
+
+def format_conn_flags(conn: Connection) -> str:
+    parts: List[str] = []
+    if not conn.managed:
+        parts.append("E")
+    if conn.has_password:
+        parts.append("P")
+    if conn.identity_file:
+        parts.append("k")
+    return "".join(parts) if parts else "-"
+
+
+def table_columns(term_width: int) -> Dict[str, int]:
+    margin = 1
+    inner = max(40, term_width - 2)
+    flags_w = COL_FLAGS_W
+    folder_w = COL_FOLDER_W
+    host_w = COL_HOST_W
+    gaps = 3
+    addr_w = inner - COL_PREFIX_W - folder_w - host_w - flags_w - gaps
+    addr_w = max(12, addr_w)
+
+    folder_x = margin + COL_PREFIX_W
+    host_x = folder_x + folder_w + 1
+    addr_x = host_x + host_w + 1
+    flags_x = margin + inner - flags_w
+
+    return {
+        "margin": margin,
+        "inner": inner,
+        "folder_w": folder_w,
+        "host_w": host_w,
+        "addr_w": addr_w,
+        "flags_w": flags_w,
+        "folder_x": folder_x,
+        "host_x": host_x,
+        "addr_x": addr_x,
+        "flags_x": flags_x,
+    }
+
+
 def safe_addstr(win, y: int, x: int, text: str, attr: int = 0) -> None:
     height, width = win.getmaxyx()
     if y < 0 or y >= height or x >= width:
@@ -1113,7 +1195,9 @@ class MainUI:
         input_row = height - 2
         new_row = height - 3
         status_row = height - 4
-        list_start = 1
+        header_row = 1
+        sep_row = 2
+        list_start = 3
         list_end = height - 5
         page_size = max(MIN_PAGE_SIZE, list_end - list_start + 1)
         return {
@@ -1121,6 +1205,8 @@ class MainUI:
             "input_row": input_row,
             "new_row": new_row,
             "status_row": status_row,
+            "header_row": header_row,
+            "sep_row": sep_row,
             "list_start": list_start,
             "list_end": list_end,
             "page_size": page_size,
@@ -1191,18 +1277,76 @@ class MainUI:
         end = self.scroll + len(visible)
         return f"{start}-{end}/{total}"
 
+    def draw_table_header(self, stdscr, width: int) -> None:
+        cols = table_columns(width)
+        attr = curses.A_BOLD if curses.has_colors() else curses.A_BOLD
+        safe_addstr(stdscr, 1, cols["margin"], " " * COL_PREFIX_W, attr)
+        safe_addstr(
+            stdscr,
+            1,
+            cols["folder_x"],
+            pad_display("分组", cols["folder_w"]),
+            attr,
+        )
+        safe_addstr(
+            stdscr,
+            1,
+            cols["host_x"],
+            pad_display("名称", cols["host_w"]),
+            attr,
+        )
+        safe_addstr(
+            stdscr,
+            1,
+            cols["addr_x"],
+            pad_display("地址", cols["addr_w"]),
+            attr,
+        )
+        safe_addstr(
+            stdscr,
+            1,
+            cols["flags_x"],
+            pad_display("标记", cols["flags_w"], "right"),
+            attr,
+        )
+
     def draw_connection_row(
         self, stdscr, row: int, width: int, conn: Connection, selected: bool
     ) -> None:
-        prefix = "> " if selected else "  "
-        badges = f" {conn.badges}" if conn.badges else ""
-        folder = conn.folder_display[:FOLDER_COL_WIDTH].ljust(FOLDER_COL_WIDTH)
-        host_col = conn.host[:14].ljust(14)
-        text = f"{prefix}{folder} {host_col} {conn.label}{badges}"
+        cols = table_columns(width)
         item_attr = curses.color_pair(1) if selected and curses.has_colors() else (
             curses.A_REVERSE if selected else 0
         )
-        safe_addstr(stdscr, row, 1, text[: max(0, width - 2)], item_attr)
+        prefix = "> " if selected else "  "
+        safe_addstr(stdscr, row, cols["margin"], prefix, item_attr)
+        safe_addstr(
+            stdscr,
+            row,
+            cols["folder_x"],
+            pad_display(conn.folder_display, cols["folder_w"]),
+            item_attr,
+        )
+        safe_addstr(
+            stdscr,
+            row,
+            cols["host_x"],
+            pad_display(conn.host, cols["host_w"]),
+            item_attr,
+        )
+        safe_addstr(
+            stdscr,
+            row,
+            cols["addr_x"],
+            pad_display(conn.label, cols["addr_w"]),
+            item_attr,
+        )
+        safe_addstr(
+            stdscr,
+            row,
+            cols["flags_x"],
+            pad_display(format_conn_flags(conn), cols["flags_w"], "right"),
+            item_attr,
+        )
 
     def draw_input_box(self, stdscr, layout: Dict[str, int], width: int) -> None:
         row = layout["input_row"]
@@ -1235,6 +1379,16 @@ class MainUI:
         layout = self.layout()
         draw_box_title(stdscr, "vnssh")
         curses.curs_set(0)
+
+        self.draw_table_header(stdscr, width)
+        sep_attr = curses.A_DIM
+        safe_addstr(
+            stdscr,
+            layout["sep_row"],
+            1,
+            ("-" * max(0, width - 2))[: max(0, width - 2)],
+            sep_attr,
+        )
 
         visible = self.visible_connections(layout)
         for idx, conn in enumerate(visible):
