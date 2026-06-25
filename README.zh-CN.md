@@ -104,7 +104,7 @@ vnssh init
 vnssh import vnssh-hosts-template.csv
 ```
 
-列名：`Category`, `host`, `hostname`, `user`, `port`, `password`, `identity_file`, `auth`（也接受 `folder` / `group` 别名）。
+列名：`category`, `host`, `hostname`, `user`, `port`, `password`, `identity_file`, `auth`（也接受 `folder` / `group` 别名）。
 
 `auth` 取值：`password` / `key` / `both`（或 `1` / `2` / `3`）。
 

@@ -104,7 +104,7 @@ vnssh init
 vnssh import vnssh-hosts-template.csv
 ```
 
-Columns: `Category`, `host`, `hostname`, `user`, `port`, `password`, `identity_file`, `auth` (`folder` / `group` aliases accepted).
+Columns: `category`, `host`, `hostname`, `user`, `port`, `password`, `identity_file`, `auth` (`folder` / `group` aliases accepted).
 
 `auth`: `password`, `key`, or `both` (also `1`, `2`, `3`).
 

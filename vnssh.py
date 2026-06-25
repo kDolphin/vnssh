@@ -124,7 +124,7 @@ IMPORT_COLUMNS = {
 }
 
 IMPORT_TEMPLATE_FIELDNAMES = (
-    "Category",
+    "category",
     "host",
     "hostname",
     "user",
@@ -3416,7 +3416,7 @@ def write_import_template(path: Path) -> bool:
         return False
     rows = [
         {
-            "Category": "Production",
+            "category": "Production",
             "host": "prod-web",
             "hostname": "203.0.113.10",
             "user": "alice",
@@ -3426,7 +3426,7 @@ def write_import_template(path: Path) -> bool:
             "auth": "password",
         },
         {
-            "Category": "Development",
+            "category": "Development",
             "host": "dev-app",
             "hostname": "10.0.0.5",
             "user": "deploy",
@@ -3671,7 +3671,7 @@ def cmd_import(argv: List[str]) -> None:
             "Usage: vnssh import [--dry-run] [--force] <file.csv>\n"
             "\n"
             "CSV headers:\n"
-            "  Category, host, hostname, user, port, password, identity_file, auth\n"
+            "  category, host, hostname, user, port, password, identity_file, auth\n"
             "\n"
             f"Run `vnssh init` to create {IMPORT_TEMPLATE_FILENAME} in the current directory.\n"
             "\n"
