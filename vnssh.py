@@ -996,13 +996,15 @@ def build_ssh_argv(host: str, *, legacy: Optional[bool] = None) -> List[str]:
     opts = entry[0] if entry else {}
     use_legacy = legacy if legacy is not None else opts.get("_vnssh_legacy") == "1"
     mode = connection_auth_mode(host)
-    if mode == AUTH_PASSWORD and keychain_has(host):
+    if mode == AUTH_PASSWORD:
         args.extend(
             [
                 "-o",
                 "PreferredAuthentications=keyboard-interactive,password",
             ]
         )
+        if not opts.get("identityfile"):
+            args.extend(["-o", "PubkeyAuthentication=no"])
     if use_legacy:
         args.extend(legacy_ssh_option_args())
     target, extra = resolve_ssh_endpoint(host)
@@ -1703,11 +1705,12 @@ class MainUI:
         self.clamp_scroll()
 
     def resume_after_ssh(self) -> None:
-        self.stdscr = curses.initscr()
+        curses.reset_prog_mode()
         curses.cbreak()
         self.stdscr.keypad(True)
         curses.set_escdelay(25)
         init_colors()
+        self.stdscr.refresh()
         self.focus_input()
         self.reload_connections()
 
@@ -1933,6 +1936,7 @@ class MainUI:
             self.focus_input()
 
     def connect_selected(self, conn: Connection) -> None:
+        curses.def_prog_mode()
         curses.endwin()
         result = connect_host(conn.host, exec_mode=False)
         self.resume_after_ssh()
