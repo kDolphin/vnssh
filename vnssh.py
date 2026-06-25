@@ -1081,6 +1081,40 @@ def askpass_env(host: str, base: Optional[Dict[str, str]] = None) -> Dict[str, s
     return env
 
 
+_BENIGN_SSH_OUTPUT = (
+    re.compile(r"^Connection to .+ closed\.?$", re.IGNORECASE),
+    re.compile(r"^Shared connection to .+ closed\.?$", re.IGNORECASE),
+)
+
+
+def is_benign_ssh_output(err: str) -> bool:
+    """True when captured SSH output only reflects a normal session ending."""
+    lines = [line.strip() for line in err.splitlines() if line.strip()]
+    if not lines:
+        return True
+    for line in lines:
+        lower = line.lower()
+        if line.startswith("Warning:") or line.startswith("** WARNING:"):
+            continue
+        if "post-quantum key exchange" in lower:
+            continue
+        if "Pseudo-terminal will not be allocated" in line:
+            continue
+        if any(pattern.search(line) for pattern in _BENIGN_SSH_OUTPUT):
+            continue
+        return False
+    return True
+
+
+def should_report_connect_error(result: ConnectResult) -> bool:
+    """Only surface status-bar errors for real failures, not normal SSH logout."""
+    if result.returncode == 0:
+        return False
+    if result.returncode == 130:
+        return False
+    return not is_benign_ssh_output((result.stderr or "").strip())
+
+
 def format_connect_error(host: str, result: ConnectResult) -> str:
     err = (result.stderr or "").strip()
 
@@ -2213,7 +2247,7 @@ class MainUI:
         prepare_terminal_for_shell()
         result = connect_host(conn.host, exec_mode=False)
         self.resume_after_ssh()
-        if result.returncode != 0:
+        if should_report_connect_error(result):
             self.message = format_connect_error(conn.host, result)
             self.draw()
 
