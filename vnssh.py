@@ -21,6 +21,7 @@ import sys
 import termios
 import tty
 import unicodedata
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -915,14 +916,80 @@ def is_askpass_mode() -> bool:
     return bool(os.environ.get("VNSSH_HOST"))
 
 
+def askpass_session_paths(session: str) -> Tuple[Path, Path]:
+    counter = VNSSH_DIR / f".askpass-{session}.count"
+    lock = VNSSH_DIR / f".askpass-{session}.lock"
+    return counter, lock
+
+
+def cleanup_askpass_session(session: str) -> None:
+    if not session:
+        return
+    counter, lock = askpass_session_paths(session)
+    counter.unlink(missing_ok=True)
+    lock.unlink(missing_ok=True)
+
+
+def read_interactive_line_from_tty(*, echo: bool = True) -> Optional[str]:
+    """Read one line from the real terminal (2FA / extra kbdint prompts)."""
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR)
+    except OSError:
+        return None
+    try:
+        attrs = termios.tcgetattr(fd)
+        saved = termios.tcgetattr(fd)
+        attrs[3] |= termios.ICANON
+        attrs[3] &= ~termios.NOFLSH
+        if echo:
+            attrs[3] |= termios.ECHO
+        else:
+            attrs[3] &= ~termios.ECHO
+        termios.tcsetattr(fd, termios.TCSADRAIN, attrs)
+        chunks: List[bytes] = []
+        try:
+            while True:
+                ch = os.read(fd, 1)
+                if not ch or ch in (b"\n", b"\r"):
+                    break
+                chunks.append(ch)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+    finally:
+        os.close(fd)
+    if not chunks:
+        return None
+    return b"".join(chunks).decode("utf-8", errors="replace").strip()
+
+
 def askpass_main() -> None:
     host = os.environ.get("VNSSH_HOST", "")
+    session = os.environ.get("VNSSH_ASKPASS_SESSION", str(os.getppid()))
     if not host:
         sys.exit(1)
-    password = keychain_get(host)
-    if password is None:
+
+    VNSSH_DIR.mkdir(parents=True, exist_ok=True)
+    counter_path, lock_path = askpass_session_paths(session)
+    count = int(counter_path.read_text()) if counter_path.exists() else 0
+    counter_path.write_text(str(count + 1))
+
+    if count == 0:
+        password = keychain_get(host)
+        if password is None:
+            sys.exit(1)
+        sys.stdout.write(password)
+        sys.stdout.flush()
+        sys.exit(0)
+
+    # Further keyboard-interactive prompts (2FA, OTP, etc.).
+    lock_path.write_text("1")
+    try:
+        response = read_interactive_line_from_tty(echo=True)
+    finally:
+        lock_path.unlink(missing_ok=True)
+    if not response:
         sys.exit(1)
-    sys.stdout.write(password)
+    sys.stdout.write(response)
     sys.stdout.flush()
     sys.exit(0)
 
@@ -1421,6 +1488,12 @@ def restore_tty_attrs(fd: int, attrs: Optional[List]) -> None:
 
 def run_ssh_with_tty(argv: List[str], env: Dict[str, str]) -> Tuple[int, str]:
     """Run ssh on a pty; relay via /dev/tty so prompts work after curses."""
+    askpass_session = env.get("VNSSH_ASKPASS_SESSION", "")
+    _, askpass_lock = askpass_session_paths(askpass_session) if askpass_session else (
+        None,
+        None,
+    )
+
     tty_fd = open_controlling_tty()
     if tty_fd is None and not sys.stdin.isatty():
         proc = subprocess.run(argv, env=env, capture_output=True, text=True)
@@ -1457,7 +1530,10 @@ def run_ssh_with_tty(argv: List[str], env: Dict[str, str]) -> Tuple[int, str]:
             if resize_pending:
                 resize_pending = False
                 sync_pty_window_size(master_fd, terminal_fd)
-            readable, _, _ = select.select([master_fd, terminal_fd], [], [], 0.2)
+            relay_fds = [master_fd]
+            if askpass_lock is None or not askpass_lock.exists():
+                relay_fds.append(terminal_fd)
+            readable, _, _ = select.select(relay_fds, [], [], 0.2)
             if master_fd in readable:
                 try:
                     data = os.read(master_fd, 8192)
@@ -1512,9 +1588,18 @@ def run_ssh_session(
     if exec_mode:
         os.execvpe("ssh", ssh_args, env)
     args = list(ssh_args)
-    if use_askpass and "-tt" not in args:
-        args.insert(1, "-tt")
-    returncode, stderr = run_ssh_with_tty(args, env)
+    session = ""
+    run_env = dict(env)
+    if use_askpass:
+        session = uuid.uuid4().hex
+        run_env["VNSSH_ASKPASS_SESSION"] = session
+        cleanup_askpass_session(session)
+        if "-tt" not in args:
+            args.insert(1, "-tt")
+    try:
+        returncode, stderr = run_ssh_with_tty(args, run_env)
+    finally:
+        cleanup_askpass_session(session)
     return ConnectResult(returncode, stderr=stderr)
 
 
