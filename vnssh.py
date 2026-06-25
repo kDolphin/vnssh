@@ -33,12 +33,10 @@ FOLDER_COMMENT_PREFIX = "#v-f:"
 FOLDER_UNCATEGORIZED = "未分类"
 COL_FOLDER_W = 12
 COL_HOST_W = 16
-COL_FLAGS_W = 6
+COL_FLAGS_W = 9
 COL_PREFIX_W = 2
 SEARCH_PREFIX = "/ "
 SEARCH_CURSOR_BLINK_MS = 500
-BADGE_KEYCHAIN = "[P]"
-BADGE_IDENTITY = "[k]"
 DEFAULT_PORT = 22
 DEFAULT_IDENTITY = "~/.ssh/id_ed25519"
 MIN_TERMINAL_HEIGHT = 14
@@ -115,14 +113,8 @@ class Connection:
 
     @property
     def badges(self) -> str:
-        parts: List[str] = []
-        if not self.managed:
-            parts.append("[ext]")
-        if self.has_password:
-            parts.append(BADGE_KEYCHAIN)
-        if self.identity_file:
-            parts.append(BADGE_IDENTITY)
-        return " ".join(parts)
+        flags = format_conn_flags(self)
+        return "" if flags == "-" else flags
 
 
 @dataclass
@@ -836,12 +828,12 @@ def pad_display(text: str, width: int, align: str = "left") -> str:
 def format_conn_flags(conn: Connection) -> str:
     parts: List[str] = []
     if not conn.managed:
-        parts.append("E")
+        parts.append("ext")
     if conn.has_password:
-        parts.append("P")
+        parts.append("p")
     if conn.identity_file:
         parts.append("k")
-    return "".join(parts) if parts else "-"
+    return " ".join(parts) if parts else "-"
 
 
 def table_columns(term_width: int) -> Dict[str, int]:
