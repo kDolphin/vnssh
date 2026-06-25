@@ -37,7 +37,9 @@ BADGE_KEYCHAIN = "[P]"
 BADGE_IDENTITY = "[k]"
 DEFAULT_PORT = 22
 DEFAULT_IDENTITY = "~/.ssh/id_ed25519"
-LIST_SLOTS = 8
+MIN_TERMINAL_HEIGHT = 12
+MIN_PAGE_SIZE = 3
+HELP_TEXT = "↑↓选 Enter连 n新建 e编 d删 PgUp/Dn/C-f/C-b翻 Esc清/退"
 
 AUTH_PASSWORD = "password"
 AUTH_KEY = "key"
@@ -1091,26 +1093,85 @@ def delete_connection(stdscr, conn: Connection) -> bool:
 
 
 class MainUI:
+    """Bottom-input layout: list on top, search box + help at bottom."""
+
     def __init__(self, stdscr) -> None:
         self.stdscr = stdscr
         self.query = ""
-        self.focus_search = True
-        self.cursor = 0
+        self.focus = "input"  # input | list
+        self.scroll = 0
+        self.list_cursor = 0
         self.connections: List[Connection] = []
         self.filtered: List[Connection] = []
         self.message = ""
         self._blink_on = True
         self.reload_connections()
 
+    def layout(self) -> Dict[str, int]:
+        height, _width = self.stdscr.getmaxyx()
+        help_row = height - 1
+        input_row = height - 2
+        new_row = height - 3
+        status_row = height - 4
+        list_start = 1
+        list_end = height - 5
+        page_size = max(MIN_PAGE_SIZE, list_end - list_start + 1)
+        return {
+            "help_row": help_row,
+            "input_row": input_row,
+            "new_row": new_row,
+            "status_row": status_row,
+            "list_start": list_start,
+            "list_end": list_end,
+            "page_size": page_size,
+        }
+
     def reload_connections(self) -> None:
         self.connections = load_connections()
-        self.apply_filter()
+        self.apply_filter(reset_scroll=True)
 
-    def apply_filter(self) -> None:
+    def apply_filter(self, reset_scroll: bool = False) -> None:
         self.filtered = sorted_connections(self.connections, self.query)
-        max_cursor = min(LIST_SLOTS, len(self.filtered))
-        if self.cursor > max_cursor:
-            self.cursor = max_cursor
+        if reset_scroll:
+            self.scroll = 0
+            self.list_cursor = 0
+        self.clamp_scroll()
+
+    def clamp_scroll(self) -> None:
+        layout = self.layout()
+        page_size = layout["page_size"]
+        max_scroll = max(0, len(self.filtered) - page_size)
+        if self.scroll > max_scroll:
+            self.scroll = max_scroll
+        visible = self.visible_connections(layout)
+        if visible and self.list_cursor >= len(visible):
+            self.list_cursor = max(0, len(visible) - 1)
+        if not visible:
+            self.list_cursor = 0
+
+    def visible_connections(self, layout: Optional[Dict[str, int]] = None) -> List[Connection]:
+        if layout is None:
+            layout = self.layout()
+        end = self.scroll + layout["page_size"]
+        return self.filtered[self.scroll : end]
+
+    def selected_connection(self) -> Optional[Connection]:
+        visible = self.visible_connections()
+        if self.focus != "list" or not visible:
+            return None
+        if 0 <= self.list_cursor < len(visible):
+            return visible[self.list_cursor]
+        return None
+
+    def focus_input(self) -> None:
+        self.focus = "input"
+        self.list_cursor = 0
+
+    def focus_list(self) -> None:
+        if not self.filtered:
+            return
+        self.focus = "list"
+        self.clamp_scroll()
 
     def resume_after_ssh(self) -> None:
         self.stdscr = curses.initscr()
@@ -1118,113 +1179,210 @@ class MainUI:
         self.stdscr.keypad(True)
         curses.set_escdelay(25)
         init_colors()
+        self.focus_input()
         self.reload_connections()
 
-    def menu_items(self) -> List[Optional[Connection]]:
-        items: List[Optional[Connection]] = [None]
-        for conn in self.filtered[:LIST_SLOTS]:
-            items.append(conn)
-        return items
+    def status_text(self, layout: Dict[str, int]) -> str:
+        total = len(self.filtered)
+        if total == 0:
+            return "0/0"
+        start = self.scroll + 1
+        visible = self.visible_connections(layout)
+        end = self.scroll + len(visible)
+        return f"{start}-{end}/{total}"
 
-    def draw(self) -> None:
-        stdscr = self.stdscr
-        stdscr.clear()
-        height, width = stdscr.getmaxyx()
-        draw_box_title(stdscr, "vnssh")
+    def draw_connection_row(
+        self, stdscr, row: int, width: int, conn: Connection, selected: bool
+    ) -> None:
+        prefix = "> " if selected else "  "
+        badges = f" {conn.badges}" if conn.badges else ""
+        folder = conn.folder_display[:FOLDER_COL_WIDTH].ljust(FOLDER_COL_WIDTH)
+        host_col = conn.host[:14].ljust(14)
+        text = f"{prefix}{folder} {host_col} {conn.label}{badges}"
+        item_attr = curses.color_pair(1) if selected and curses.has_colors() else (
+            curses.A_REVERSE if selected else 0
+        )
+        safe_addstr(stdscr, row, 1, text[: max(0, width - 2)], item_attr)
 
-        search_text = self.query
-        curses.curs_set(0)
+    def draw_input_box(self, stdscr, layout: Dict[str, int], width: int) -> None:
+        row = layout["input_row"]
+        inner_w = max(0, width - 4)
+        border = curses.A_DIM
+        safe_addstr(stdscr, row, 1, "|", border)
+        safe_addstr(stdscr, row, width - 2, "|", border)
 
-        if self.focus_search:
+        if self.focus == "input":
             attr = curses.color_pair(2) | curses.A_BOLD if curses.has_colors() else curses.A_BOLD
         else:
             attr = curses.A_DIM
 
-        row_x = 2
-        safe_addstr(stdscr, 2, row_x, SEARCH_PREFIX, attr)
-        row_x += len(SEARCH_PREFIX)
-        if search_text:
-            safe_addstr(stdscr, 2, row_x, search_text, attr)
-            row_x += len(search_text)
-        if self.focus_search and self._blink_on and row_x < width - 1:
-            cursor_char = "_" if not search_text else "|"
-            cursor_attr = attr | curses.A_REVERSE
-            safe_addstr(stdscr, 2, row_x, cursor_char, cursor_attr)
-        elif not search_text and not self.focus_search:
-            safe_addstr(stdscr, 2, row_x, "_", curses.A_DIM)
+        x = 2
+        safe_addstr(stdscr, row, x, SEARCH_PREFIX, attr)
+        x += len(SEARCH_PREFIX)
+        if self.query:
+            safe_addstr(stdscr, row, x, self.query[: max(0, inner_w - len(SEARCH_PREFIX))], attr)
+            x += len(self.query)
+        if self.focus == "input" and self._blink_on and x < width - 2:
+            cursor_char = "_" if not self.query else "|"
+            safe_addstr(stdscr, row, x, cursor_char, attr | curses.A_REVERSE)
+        elif not self.query and self.focus != "input":
+            safe_addstr(stdscr, row, x, "_", curses.A_DIM)
 
-        safe_addstr(stdscr, 3, 2, "-" * max(0, width - 4))
+    def draw(self) -> None:
+        stdscr = self.stdscr
+        stdscr.clear()
+        _height, width = stdscr.getmaxyx()
+        layout = self.layout()
+        draw_box_title(stdscr, "vnssh")
+        curses.curs_set(0)
 
-        items = self.menu_items()
-        row = 4
-        for idx, item in enumerate(items):
-            selected = not self.focus_search and self.cursor == idx
-            prefix = "> " if selected else "  "
-            if item is None:
-                text = "新建 SSH 连接"
-            else:
-                badges = f" {item.badges}" if item.badges else ""
-                folder = item.folder_display[:FOLDER_COL_WIDTH].ljust(FOLDER_COL_WIDTH)
-                host_col = item.host[:14].ljust(14)
-                text = f"{folder} {host_col} {item.label}{badges}"
-            item_attr = curses.color_pair(1) if selected and curses.has_colors() else (
-                curses.A_REVERSE if selected else 0
-            )
-            safe_addstr(stdscr, row, 2, f"{prefix}{text}"[: max(0, width - 4)], item_attr)
-            row += 1
+        visible = self.visible_connections(layout)
+        for idx, conn in enumerate(visible):
+            row = layout["list_start"] + idx
+            if row > layout["list_end"]:
+                break
+            selected = self.focus == "list" and idx == self.list_cursor
+            self.draw_connection_row(stdscr, row, width, conn, selected)
 
-        help_y = max(row + 1, height - 3)
-        help_text = "输入:搜索  ↑↓:移动  Enter:确认  e:编辑  d:删除  Esc:清空/退出"
-        safe_addstr(stdscr, help_y, 2, help_text[: max(0, width - 4)], curses.A_DIM)
+        status = self.status_text(layout)
+        safe_addstr(
+            stdscr,
+            layout["status_row"],
+            1,
+            status.rjust(max(0, width - 2))[: max(0, width - 2)],
+            curses.A_DIM,
+        )
+
+        new_attr = curses.A_BOLD if curses.has_colors() else curses.A_BOLD
+        safe_addstr(
+            stdscr,
+            layout["new_row"],
+            1,
+            "+ 新建 SSH 连接  (n)"[: max(0, width - 2)],
+            new_attr,
+        )
+
+        self.draw_input_box(stdscr, layout, width)
+
+        safe_addstr(
+            stdscr,
+            layout["help_row"],
+            1,
+            HELP_TEXT[: max(0, width - 2)],
+            curses.A_DIM,
+        )
         if self.message:
-            safe_addstr(stdscr, help_y + 1, 2, self.message[: max(0, width - 4)], curses.color_pair(3))
+            safe_addstr(
+                stdscr,
+                layout["status_row"],
+                1,
+                self.message[: max(0, width - len(status) - 4)],
+                curses.color_pair(3),
+            )
 
         stdscr.refresh()
 
-    def handle_search_key(self, ch: int, char: Optional[str]) -> bool:
+    def page_scroll(self, direction: int) -> None:
+        layout = self.layout()
+        step = layout["page_size"]
+        max_scroll = max(0, len(self.filtered) - step)
+        self.scroll = max(0, min(self.scroll + direction * step, max_scroll))
+        self.clamp_scroll()
+
+    def move_list(self, delta: int) -> None:
+        if not self.filtered:
+            self.focus_input()
+            return
+
+        layout = self.layout()
+        visible = self.visible_connections(layout)
+        if not visible:
+            return
+
+        if delta < 0:
+            if self.list_cursor > 0:
+                self.list_cursor -= 1
+            elif self.scroll > 0:
+                self.scroll -= 1
+            else:
+                self.focus_input()
+            return
+
+        if self.list_cursor < len(visible) - 1:
+            self.list_cursor += 1
+        elif self.scroll + self.list_cursor < len(self.filtered) - 1:
+            self.scroll += 1
+        else:
+            self.focus_input()
+
+    def connect_selected(self, conn: Connection) -> None:
+        curses.endwin()
+        connect_host(conn.host, exec_mode=False)
+        self.resume_after_ssh()
+
+    def open_new_wizard(self) -> None:
+        wizard_new(self.stdscr)
+        self.reload_connections()
+
+    def handle_input_key(self, ch: int, char: Optional[str]) -> Optional[str]:
         if ch in (8, 127, curses.KEY_BACKSPACE):
             self.query = self.query[:-1]
-            self.apply_filter()
-            return True
+            self.apply_filter(reset_scroll=True)
+            return None
         if ch == 27:
             if self.query:
                 self.query = ""
-                self.apply_filter()
-                return True
-            return False
-        if ch in (curses.KEY_DOWN, 9):
-            self.focus_search = False
-            self.cursor = 0
-            return True
-        if char and char.isprintable() and len(char) == 1:
-            self.query += char
-            self.apply_filter()
-            return True
-        return True
-
-    def handle_menu_key(self, ch: int, char: Optional[str]) -> Optional[str]:
-        items = self.menu_items()
-        max_idx = len(items) - 1
-
+                self.apply_filter(reset_scroll=True)
+                return None
+            return "quit"
         if ch in (curses.KEY_UP,):
-            if self.cursor == 0:
-                self.focus_search = True
-            else:
-                self.cursor -= 1
+            self.focus_list()
             return None
         if ch in (curses.KEY_DOWN,):
-            if self.cursor < max_idx:
-                self.cursor += 1
+            return None
+        if ch in (ord("n"), ord("N")):
+            return "new"
+        if ch in (10, 13, curses.KEY_ENTER):
+            if len(self.filtered) == 1:
+                return "connect_one"
+            if self.filtered:
+                self.focus_list()
+            return None
+        if char and char.isprintable() and len(char) == 1:
+            self.query += char
+            self.apply_filter(reset_scroll=True)
+            return None
+        return None
+
+    def handle_list_key(self, ch: int, char: Optional[str]) -> Optional[str]:
+        if ch in (curses.KEY_UP,):
+            self.move_list(-1)
+            return None
+        if ch in (curses.KEY_DOWN,):
+            self.move_list(1)
+            return None
+        if ch in (curses.KEY_PPAGE, 2):  # PgUp, Ctrl-B
+            self.page_scroll(-1)
+            return None
+        if ch in (curses.KEY_NPAGE, 6):  # PgDn, Ctrl-F
+            self.page_scroll(1)
             return None
         if ch == 27:
-            self.focus_search = True
+            self.focus_input()
             return None
+        if ch in (ord("n"), ord("N")):
+            return "new"
         if ch in (ord("e"), ord("E")):
             return "edit"
         if ch in (ord("d"), ord("D")):
             return "delete"
         if ch in (10, 13, curses.KEY_ENTER):
-            return "activate"
+            return "connect"
+        if char and char.isprintable() and len(char) == 1:
+            self.focus_input()
+            self.query += char
+            self.apply_filter(reset_scroll=True)
+            return None
         return None
 
     def run(self) -> None:
@@ -1232,49 +1390,49 @@ class MainUI:
         while True:
             self.message = ""
             self.draw()
-            if self.focus_search:
+            if self.focus == "input":
                 self.stdscr.timeout(SEARCH_CURSOR_BLINK_MS)
             else:
                 self.stdscr.timeout(-1)
 
             char, ch = getch_utf8(self.stdscr)
 
-            if ch == -1 and self.focus_search:
+            if ch == -1 and self.focus == "input":
                 self._blink_on = not self._blink_on
                 continue
 
-            if self.focus_search:
-                if not self.handle_search_key(ch, char):
+            action: Optional[str] = None
+            if self.focus == "input":
+                action = self.handle_input_key(ch, char)
+                if action == "quit":
                     break
-                continue
+            else:
+                action = self.handle_list_key(ch, char)
 
-            action = self.handle_menu_key(ch, char)
             if action is None:
                 continue
-
-            items = self.menu_items()
-            selected = items[self.cursor] if self.cursor < len(items) else None
-
-            if action == "activate":
-                if selected is None:
-                    wizard_new(self.stdscr)
-                    self.reload_connections()
-                else:
-                    curses.endwin()
-                    connect_host(selected.host, exec_mode=False)
-                    self.resume_after_ssh()
+            if action == "new":
+                self.open_new_wizard()
+            elif action == "connect_one":
+                self.connect_selected(self.filtered[0])
+            elif action == "connect":
+                conn = self.selected_connection()
+                if conn:
+                    self.connect_selected(conn)
             elif action == "edit":
-                if selected is None:
-                    self.message = "请选择一条连接再编辑"
-                else:
-                    wizard_edit(self.stdscr, selected)
+                conn = self.selected_connection()
+                if conn:
+                    wizard_edit(self.stdscr, conn)
                     self.reload_connections()
-            elif action == "delete":
-                if selected is None:
-                    self.message = "请选择一条连接再删除"
                 else:
-                    if delete_connection(self.stdscr, selected):
+                    self.message = "请选择一条连接再编辑"
+            elif action == "delete":
+                conn = self.selected_connection()
+                if conn:
+                    if delete_connection(self.stdscr, conn):
                         self.reload_connections()
+                else:
+                    self.message = "请选择一条连接再删除"
 
 
 def main_curses(stdscr) -> None:
@@ -1284,7 +1442,7 @@ def main_curses(stdscr) -> None:
     curses.cbreak()
     stdscr.nodelay(False)
     height, width = stdscr.getmaxyx()
-    if height < 14 or width < 40:
+    if height < MIN_TERMINAL_HEIGHT or width < 40:
         raise SystemExit("终端窗口太小，请放大后重试。")
     MainUI(stdscr).run()
 
