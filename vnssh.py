@@ -6,13 +6,17 @@ from __future__ import annotations
 import csv
 import curses
 import base64
+import fcntl
 import gzip
 import json
 import os
+import pty
 import re
+import select
 import shlex
 import subprocess
 import sys
+import termios
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -965,6 +969,8 @@ def askpass_env(host: str, base: Optional[Dict[str, str]] = None) -> Dict[str, s
 def format_connect_error(host: str, result: ConnectResult) -> str:
     err = (result.stderr or "").strip()
     if "Permission denied" in err:
+        if not keychain_has(host):
+            return f"{host}: authentication failed (no saved password; press e to store)"
         return f"{host}: authentication failed (check password or key)"
     if "no matching key exchange" in err:
         return f"{host}: SSH algorithm mismatch"
@@ -983,6 +989,8 @@ def format_connect_error(host: str, result: ConnectResult) -> str:
             continue
         return f"{host}: {text[:100]}"
     if result.returncode != 0:
+        if not keychain_has(host):
+            return f"{host}: connection failed (enter password at prompt, or e to save)"
         return f"{host}: connection failed (check password/key or VPN)"
     return f"{host}: connection closed"
 
@@ -996,15 +1004,15 @@ def build_ssh_argv(host: str, *, legacy: Optional[bool] = None) -> List[str]:
     opts = entry[0] if entry else {}
     use_legacy = legacy if legacy is not None else opts.get("_vnssh_legacy") == "1"
     mode = connection_auth_mode(host)
-    if mode == AUTH_PASSWORD:
+    if mode == AUTH_PASSWORD and keychain_has(host):
         args.extend(
             [
                 "-o",
                 "PreferredAuthentications=keyboard-interactive,password",
+                "-o",
+                "PubkeyAuthentication=no",
             ]
         )
-        if not opts.get("identityfile"):
-            args.extend(["-o", "PubkeyAuthentication=no"])
     if use_legacy:
         args.extend(legacy_ssh_option_args())
     target, extra = resolve_ssh_endpoint(host)
@@ -1035,6 +1043,69 @@ def probe_algorithm_mismatch(host: str) -> bool:
     return ssh_algorithm_mismatch(ConnectResult(proc.returncode, proc.stderr))
 
 
+def prepare_terminal_for_shell() -> None:
+    """Restore canonical terminal mode after curses endwin()."""
+    if not sys.stdin.isatty():
+        return
+    fd = sys.stdin.fileno()
+    attrs = termios.tcgetattr(fd)
+    attrs[3] |= termios.ICANON | termios.ECHO
+    attrs[3] &= ~termios.NOFLSH
+    termios.tcsetattr(fd, termios.TCSADRAIN, attrs)
+
+
+def sync_pty_window_size(master_fd: int) -> None:
+    if not sys.stdin.isatty():
+        return
+    try:
+        buf = fcntl.ioctl(sys.stdin, termios.TIOCGWINSZ, b"\0" * 8)
+        fcntl.ioctl(master_fd, termios.TIOCSWINSZ, buf)
+    except OSError:
+        pass
+
+
+def run_ssh_with_tty(argv: List[str], env: Dict[str, str]) -> int:
+    """Run ssh on a pty so password prompts work after curses."""
+    if not sys.stdin.isatty():
+        return subprocess.call(argv, env=env)
+
+    pid, master_fd = pty.fork()
+    if pid == 0:
+        os.execvpe(argv[0], argv, env)
+
+    sync_pty_window_size(master_fd)
+    stdin_fd = sys.stdin.fileno()
+    stdout_fd = sys.stdout.fileno()
+    try:
+        while True:
+            readable, _, _ = select.select([master_fd, stdin_fd], [], [])
+            if master_fd in readable:
+                try:
+                    data = os.read(master_fd, 8192)
+                except OSError:
+                    break
+                if not data:
+                    break
+                os.write(stdout_fd, data)
+            if stdin_fd in readable:
+                try:
+                    data = os.read(stdin_fd, 8192)
+                except OSError:
+                    break
+                if not data:
+                    break
+                os.write(master_fd, data)
+    finally:
+        os.close(master_fd)
+        _, status = os.waitpid(pid, 0)
+
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return 128 + os.WTERMSIG(status)
+    return 1
+
+
 def connect_host(
     host: str, use_keychain: bool = True, exec_mode: bool = True
 ) -> ConnectResult:
@@ -1047,13 +1118,21 @@ def connect_host(
 
     ssh_args = build_ssh_argv(host, legacy=legacy)
     env = os.environ.copy()
-    if use_keychain and keychain_has(host):
+    use_askpass = use_keychain and keychain_has(host)
+    if use_askpass:
         env = askpass_env(host, env)
+    else:
+        for var in ("SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "VNSSH_HOST"):
+            env.pop(var, None)
+        ssh_args.insert(1, "-tt")
 
     if exec_mode:
         os.execvpe("ssh", ssh_args, env)
 
-    returncode = subprocess.call(ssh_args, env=env)
+    if use_askpass:
+        returncode = subprocess.call(ssh_args, env=env)
+    else:
+        returncode = run_ssh_with_tty(ssh_args, env)
     return ConnectResult(returncode)
 
 
@@ -1938,6 +2017,7 @@ class MainUI:
     def connect_selected(self, conn: Connection) -> None:
         curses.def_prog_mode()
         curses.endwin()
+        prepare_terminal_for_shell()
         result = connect_host(conn.host, exec_mode=False)
         self.resume_after_ssh()
         if result.returncode != 0:
