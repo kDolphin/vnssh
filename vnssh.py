@@ -145,10 +145,7 @@ class Connection:
 
     @property
     def folder_display(self) -> str:
-        value = normalize_folder(self.folder)
-        if value == FOLDER_UNCATEGORIZED:
-            return "未分类"
-        return value
+        return normalize_folder(self.folder)
 
     @property
     def label(self) -> str:
@@ -1659,7 +1656,7 @@ def read_line_input(
 # ---------------------------------------------------------------------------
 
 WIZARD_FIELDS_FULL = [
-    ("folder", "分类 (留空=未分类): ", False),
+    ("folder", "Category (empty=Uncategorized): ", False),
     ("host", "Name (Host): ", False),
     ("hostname", "Address (IP/domain): ", False),
     ("port", f"Port [{DEFAULT_PORT}]: ", False),
@@ -1989,7 +1986,7 @@ class MainUI:
             stdscr,
             1,
             cols["folder_x"],
-            pad_display("分类", cols["folder_w"]),
+            pad_display("Category", cols["folder_w"]),
             attr,
         )
         safe_addstr(
