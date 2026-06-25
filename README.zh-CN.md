@@ -113,7 +113,7 @@ vnssh import vnssh-hosts-template.csv
 
 - 默认开启，目录：`~/.vnssh/sessions/`
 - 仅记录**登录成功后**的终端输出（不含 OTP 等认证阶段）
-- 腾讯云堡垒机：二次登录成功后会生成独立文件，形如 `时间_目标IP_用户_via_堡垒机名.session`
+- 腾讯云堡垒机：二次登录成功后会生成独立文件，形如 `目标IP_用户_via_堡垒机名_时间.session`
 - 关闭：`VNSSH_SESSION_LOG=0 vnssh`
 
 ## 安全说明

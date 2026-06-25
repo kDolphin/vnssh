@@ -1848,14 +1848,14 @@ def allocate_session_log_path(host: str, started: datetime) -> Path:
     port = int(fields["port"])
     stamp = started.strftime("%Y-%m-%d_%H%M%S")
     base = (
-        f"{stamp}_{sanitize_log_component(host)}_"
+        f"{sanitize_log_component(host)}_"
         f"{sanitize_log_component(endpoint)}"
     )
     if port != DEFAULT_PORT:
         base += f"_p{port}"
     suffix = 0
     while True:
-        name = base if suffix == 0 else f"{base}_{suffix}"
+        name = f"{base}_{stamp}" if suffix == 0 else f"{base}_{stamp}_{suffix}"
         transcript = SESSIONS_DIR / f"{name}.session"
         if not transcript.exists():
             return transcript
@@ -1873,7 +1873,7 @@ def allocate_nested_session_log_path(
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     stamp = started.strftime("%Y-%m-%d_%H%M%S")
     base = (
-        f"{stamp}_{sanitize_log_component(target_host)}_"
+        f"{sanitize_log_component(target_host)}_"
         f"{sanitize_log_component(target_user)}"
         f"_via_{sanitize_log_component(bastion_host)}"
     )
@@ -1881,7 +1881,7 @@ def allocate_nested_session_log_path(
         base += f"_p{target_port}"
     suffix = 0
     while True:
-        name = base if suffix == 0 else f"{base}_{suffix}"
+        name = f"{base}_{stamp}" if suffix == 0 else f"{base}_{stamp}_{suffix}"
         transcript = SESSIONS_DIR / f"{name}.session"
         if not transcript.exists():
             return transcript

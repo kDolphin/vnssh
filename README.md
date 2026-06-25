@@ -113,7 +113,7 @@ Columns (same order as the template):
 
 - Enabled by default; files under `~/.vnssh/sessions/`
 - Logs terminal output **after** login (not OTP/password prompts)
-- Tencent Cloud bastion: a separate log file is created per nested target login, e.g. `2026-06-25_120000_10.0.0.1_user_via_bastion-example.session`
+- Tencent Cloud bastion: a separate log file is created per nested target login, e.g. `10.0.0.1_user_via_bastion-example_2026-06-25_120000.session`
 - Disable: `VNSSH_SESSION_LOG=0 vnssh`
 
 ## Security
