@@ -6,7 +6,7 @@ macOS 上的 SSH 启动器：终端 TUI 搜主机、Keychain 存密码、支持 
 
 ## 功能
 
-- **TUI 列表**：按名称、地址、分组搜索（支持拼音首字母）
+- **TUI 列表**：按分类、名称、地址搜索（支持拼音首字母）
 - **Keychain 密码**：密码不进配置文件，由 macOS 钥匙串管理
 - **OpenSSH 集成**：自动维护 `~/.ssh/config` 的 `Include`，与现有配置共存
 - **2FA / 堡垒机**：`#v-2fa` 主机自动填密码，OTP 在终端手输
@@ -37,8 +37,29 @@ chmod +x vnssh.py
 
 1. 运行 `vnssh` 打开 TUI
 2. 按 **Ctrl-N** 新建连接
-3. 按向导填写名称、地址、用户、认证方式；密码可选，会存入 Keychain（服务名 `vnssh`）
+3. 按向导填写分类、名称、地址、用户、认证方式；密码可选，会存入 Keychain（服务名 `vnssh`）
 4. 选中主机，**Enter** 连接
+
+## 配置文件
+
+主机定义在 `~/.vnssh/hosts.conf`，格式与 OpenSSH 一致。可在某个 `Host` 块**上方**加注释：
+
+| 注释 | 含义 |
+|------|------|
+| `#v-f:分类名` | TUI 中的 Category 列 |
+| `#v-2fa` | 需二次验证（自动填密码 + 终端输入 OTP） |
+| `#v-legacy` | 老设备 SSH 算法（可选；不配也会在首次失败后自动学习） |
+
+示例：
+
+```sshconfig
+#v-f:Production
+#v-2fa
+Host bastion-example
+    HostName 203.0.113.10
+    User alice
+    Port 8321
+```
 
 ## TUI 快捷键
 
@@ -61,31 +82,32 @@ vnssh list
 vnssh connect <Host名>
 vnssh import hosts.csv
 vnssh import --dry-run file.csv
-vnssh init          # 初始化 ~/.vnssh，并在当前目录生成导入模板 CSV
+vnssh init
 ```
 
-`vnssh init` 具有幂等性：若 `~/.vnssh/hosts.conf` 与 `~/.ssh/config` 中的 `Include` 行均已存在，则跳过初始化。会在**当前目录**生成 `vnssh-hosts-template.csv`（已存在则跳过）。编辑后执行 `vnssh import vnssh-hosts-template.csv` 即可导入。
+## CSV 导入
 
-## 配置文件
+在当前目录生成模板、编辑后导入：
 
-主机定义在 `~/.vnssh/hosts.conf`，格式与 OpenSSH 一致。可在某个 `Host` 块**上方**加注释：
+```bash
+vnssh init
+vnssh import vnssh-hosts-template.csv
+```
 
-| 注释 | 含义 |
+`vnssh init` 具有幂等性：若 `~/.vnssh/hosts.conf` 与 `~/.ssh/config` 中的 `Include` 行均已存在，则跳过初始化。当前目录已有模板文件时也会跳过生成。
+
+列名（与模板顺序一致）：
+
+| 列名 | 说明 |
 |------|------|
-| `#v-f:分组名` | 分组（TUI 里显示） |
-| `#v-2fa` | 需二次验证（自动填密码 + 终端输入 OTP） |
-| `#v-legacy` | 老设备 SSH 算法（可选；不配也会在首次失败后自动学习） |
-
-示例：
-
-```sshconfig
-#v-f:Production
-#v-2fa
-Host bastion-example
-    HostName 203.0.113.10
-    User alice
-    Port 8321
-```
+| `category` | TUI Category 列（留空为 Uncategorized） |
+| `host` | 连接名称（SSH `Host` 别名） |
+| `hostname` | IP 或域名 |
+| `user` | SSH 用户名 |
+| `port` | 端口（默认 `22`） |
+| `password` | 可选；导入时写入 Keychain |
+| `identity_file` | 私钥路径（如 `~/.ssh/id_ed25519`） |
+| `auth` | `password` / `key` / `both`（或 `1` / `2` / `3`） |
 
 ## 会话日志
 
@@ -93,20 +115,6 @@ Host bastion-example
 - 仅记录**登录成功后**的终端输出（不含 OTP 等认证阶段）
 - 腾讯云堡垒机：二次登录成功后会生成独立文件，形如 `时间_目标IP_用户_via_堡垒机名.session`
 - 关闭：`VNSSH_SESSION_LOG=0 vnssh`
-
-## CSV 导入
-
-在当前目录生成模板：
-
-```bash
-vnssh init
-# 生成 vnssh-hosts-template.csv（含示例行）
-vnssh import vnssh-hosts-template.csv
-```
-
-列名：`category`, `host`, `hostname`, `user`, `port`, `password`, `identity_file`, `auth`（也接受 `folder` / `group` 别名）。
-
-`auth` 取值：`password` / `key` / `both`（或 `1` / `2` / `3`）。
 
 ## 安全说明
 

@@ -6,7 +6,7 @@ macOS SSH launcher with a terminal UI, Keychain-backed passwords, 2FA bastion su
 
 ## Features
 
-- **TUI host list** — search by name, address, or folder (pinyin initials supported)
+- **TUI host list** — search by category, name, or address (pinyin initials supported)
 - **Keychain passwords** — credentials stay out of config files
 - **OpenSSH integration** — manages `Include ~/.vnssh/hosts.conf` in `~/.ssh/config`
 - **2FA / bastion hosts** — auto-fill password via PTY; enter OTP in the terminal (`#v-2fa`)
@@ -37,8 +37,29 @@ No separate `init` step is required. On first run, vnssh automatically:
 
 1. Run `vnssh`
 2. Press **Ctrl-N** to open the new-host wizard
-3. Fill in name, address, user, and auth; optional password is stored in Keychain (service `vnssh`)
+3. Fill in category, name, address, user, and auth; optional password is stored in Keychain (service `vnssh`)
 4. Select the host and press **Enter** to connect
+
+## Configuration
+
+Hosts live in `~/.vnssh/hosts.conf` (OpenSSH format). Optional comment lines above a `Host` block:
+
+| Comment | Purpose |
+|---------|---------|
+| `#v-f:Name` | Category label in the TUI |
+| `#v-2fa` | Keyboard-interactive 2FA (PTY password inject + manual OTP) |
+| `#v-legacy` | Legacy SSH algorithms (optional; auto-detected on first failure) |
+
+Example:
+
+```sshconfig
+#v-f:Production
+#v-2fa
+Host bastion-example
+    HostName 203.0.113.10
+    User alice
+    Port 8321
+```
 
 ## TUI shortcuts
 
@@ -61,31 +82,32 @@ vnssh list
 vnssh connect <Host>
 vnssh import hosts.csv
 vnssh import --dry-run hosts.csv
-vnssh init          # setup ~/.vnssh + write vnssh-hosts-template.csv here
+vnssh init
 ```
 
-`vnssh init` is idempotent: if `~/.vnssh/hosts.conf` and the `Include` line in `~/.ssh/config` already exist, setup is skipped. It also writes `vnssh-hosts-template.csv` in the current directory (skipped if the file already exists). Edit it and run `vnssh import vnssh-hosts-template.csv`.
+## CSV import
 
-## Configuration
+Generate a template in the current directory, edit it, then import:
 
-Hosts live in `~/.vnssh/hosts.conf` (OpenSSH format). Optional comment lines above a `Host` block:
-
-| Comment | Purpose |
-|---------|---------|
-| `#v-f:Name` | Folder / category in the TUI |
-| `#v-2fa` | Keyboard-interactive 2FA (PTY password inject + manual OTP) |
-| `#v-legacy` | Legacy SSH algorithms (optional; auto-detected on first failure) |
-
-Example:
-
-```sshconfig
-#v-f:Production
-#v-2fa
-Host bastion-example
-    HostName 203.0.113.10
-    User alice
-    Port 8321
+```bash
+vnssh init
+vnssh import vnssh-hosts-template.csv
 ```
+
+`vnssh init` is idempotent: if `~/.vnssh/hosts.conf` and the `Include` line in `~/.ssh/config` already exist, setup is skipped. The template file is skipped when it already exists in the current directory.
+
+Columns (same order as the template):
+
+| Column | Description |
+|--------|-------------|
+| `category` | TUI category label (empty = Uncategorized) |
+| `host` | Connection name (SSH `Host` alias) |
+| `hostname` | IP address or domain |
+| `user` | SSH username |
+| `port` | SSH port (default `22`) |
+| `password` | Optional; stored in Keychain on import |
+| `identity_file` | Path to private key (e.g. `~/.ssh/id_ed25519`) |
+| `auth` | `password`, `key`, or `both` (also `1`, `2`, `3`) |
 
 ## Session logging
 
@@ -93,20 +115,6 @@ Host bastion-example
 - Logs terminal output **after** login (not OTP/password prompts)
 - Tencent Cloud bastion: a separate log file is created per nested target login, e.g. `2026-06-25_120000_10.0.0.1_user_via_bastion-example.session`
 - Disable: `VNSSH_SESSION_LOG=0 vnssh`
-
-## CSV import
-
-Generate a template in the current directory:
-
-```bash
-vnssh init
-# creates vnssh-hosts-template.csv (with sample rows)
-vnssh import vnssh-hosts-template.csv
-```
-
-Columns: `category`, `host`, `hostname`, `user`, `port`, `password`, `identity_file`, `auth` (`folder` / `group` aliases accepted).
-
-`auth`: `password`, `key`, or `both` (also `1`, `2`, `3`).
 
 ## Security
 
