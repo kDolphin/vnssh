@@ -953,14 +953,13 @@ def resolve_ssh_endpoint(host: str) -> Tuple[str, List[str]]:
     return host, extra
 
 
-def askpass_ssh_options() -> List[str]:
-    """Fail fast when Keychain password is wrong; never wait on a TTY prompt."""
-    return [
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "NumberOfPasswordPrompts=1",
-    ]
+def askpass_env(host: str, base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    env = (base or os.environ).copy()
+    env["VNSSH_HOST"] = host
+    env["SSH_ASKPASS"] = askpass_program()
+    env["SSH_ASKPASS_REQUIRE"] = "force"
+    env["DISPLAY"] = env.get("DISPLAY", ":0")
+    return env
 
 
 def format_connect_error(host: str, result: ConnectResult) -> str:
@@ -984,7 +983,7 @@ def format_connect_error(host: str, result: ConnectResult) -> str:
             continue
         return f"{host}: {text[:100]}"
     if result.returncode != 0:
-        return f"{host}: connection failed (exit {result.returncode})"
+        return f"{host}: connection failed (check password/key or VPN)"
     return f"{host}: connection closed"
 
 
@@ -1001,9 +1000,7 @@ def build_ssh_argv(host: str, *, legacy: Optional[bool] = None) -> List[str]:
         args.extend(
             [
                 "-o",
-                "PreferredAuthentications=password",
-                "-o",
-                "PubkeyAuthentication=no",
+                "PreferredAuthentications=keyboard-interactive,password",
             ]
         )
     if use_legacy:
@@ -1014,71 +1011,48 @@ def build_ssh_argv(host: str, *, legacy: Optional[bool] = None) -> List[str]:
     return args
 
 
-def run_ssh_subprocess(
-    host: str, use_keychain: bool = True, *, legacy: bool = False
-) -> ConnectResult:
-    ssh_args = build_ssh_argv(host, legacy=legacy)
-    env = os.environ.copy()
-    use_askpass = use_keychain and keychain_has(host)
-    if use_askpass:
-        env["VNSSH_HOST"] = host
-        env["SSH_ASKPASS"] = askpass_program()
-        env["SSH_ASKPASS_REQUIRE"] = "force"
-        env["DISPLAY"] = env.get("DISPLAY", ":0")
-        target = ssh_args[-1]
-        ssh_args = ssh_args[:-1] + askpass_ssh_options() + [target]
-    proc = subprocess.run(
-        ssh_args,
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    return ConnectResult(proc.returncode, proc.stderr, proc.stdout)
+def probe_algorithm_mismatch(host: str) -> bool:
+    """Detect old SSH algorithms without user config or authentication."""
+    target, extra = resolve_ssh_endpoint(host)
+    args = [
+        "ssh",
+        "-F",
+        "none",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "KexAlgorithms=curve25519-sha256,diffie-hellman-group16-sha512",
+    ]
+    args.extend(extra)
+    args.append(target)
+    proc = subprocess.run(args, capture_output=True, text=True)
+    return ssh_algorithm_mismatch(ConnectResult(proc.returncode, proc.stderr))
 
 
 def connect_host(
     host: str, use_keychain: bool = True, exec_mode: bool = True
 ) -> ConnectResult:
-    """Run ssh. exec_mode=True replaces process (CLI); TUI captures errors."""
+    """Run ssh. exec_mode=True replaces process (CLI); TUI returns exit code."""
     record_use(host)
     legacy = host_legacy_enabled(host)
+    if not legacy and probe_algorithm_mismatch(host):
+        persist_legacy_host(host)
+        legacy = True
 
-    if not legacy:
-        probe = run_ssh_subprocess(host, use_keychain, legacy=False)
-        if ssh_algorithm_mismatch(probe):
-            persist_legacy_host(host)
-            legacy = True
-        elif exec_mode:
-            ssh_args = build_ssh_argv(host, legacy=False)
-            env = os.environ.copy()
-            if use_keychain and keychain_has(host):
-                env["VNSSH_HOST"] = host
-                env["SSH_ASKPASS"] = askpass_program()
-                env["SSH_ASKPASS_REQUIRE"] = "force"
-                env["DISPLAY"] = env.get("DISPLAY", ":0")
-                target = ssh_args[-1]
-                ssh_args = ssh_args[:-1] + askpass_ssh_options() + [target]
-                os.execvpe("ssh", ssh_args, env)
-            os.execvp("ssh", ssh_args)
+    ssh_args = build_ssh_argv(host, legacy=legacy)
+    env = os.environ.copy()
+    if use_keychain and keychain_has(host):
+        env = askpass_env(host, env)
 
     if exec_mode:
-        ssh_args = build_ssh_argv(host, legacy=legacy)
-        env = os.environ.copy()
-        if use_keychain and keychain_has(host):
-            env["VNSSH_HOST"] = host
-            env["SSH_ASKPASS"] = askpass_program()
-            env["SSH_ASKPASS_REQUIRE"] = "force"
-            env["DISPLAY"] = env.get("DISPLAY", ":0")
-            target = ssh_args[-1]
-            ssh_args = ssh_args[:-1] + askpass_ssh_options() + [target]
-            os.execvpe("ssh", ssh_args, env)
-        os.execvp("ssh", ssh_args)
+        os.execvpe("ssh", ssh_args, env)
 
-    result = run_ssh_subprocess(host, use_keychain, legacy=legacy)
-    if not legacy and ssh_algorithm_mismatch(result):
-        persist_legacy_host(host)
-        result = run_ssh_subprocess(host, use_keychain, legacy=True)
-    return result
+    returncode = subprocess.call(ssh_args, env=env)
+    return ConnectResult(returncode)
 
 
 def apply_keychain_password(host: str, password: str) -> None:
@@ -1963,8 +1937,6 @@ class MainUI:
         result = connect_host(conn.host, exec_mode=False)
         self.resume_after_ssh()
         if result.returncode != 0:
-            self.message = format_connect_error(conn.host, result)
-        elif "closed" in (result.stderr or "").lower():
             self.message = format_connect_error(conn.host, result)
 
     def open_new_wizard(self) -> None:
