@@ -14,6 +14,7 @@ import pty
 import re
 import select
 import shlex
+import shutil
 import subprocess
 import sys
 import termios
@@ -634,6 +635,25 @@ def format_host_block(data: WizardData) -> str:
     return "\n".join(lines) + "\n"
 
 
+KNOWN_HOST_BLOCK_KEYS = frozenset(
+    {
+        "hostname",
+        "user",
+        "port",
+        "identityfile",
+        "stricthostkeychecking",
+        "connecttimeout",
+    }
+)
+
+
+def backup_hosts_conf(path: Path = HOSTS_CONF) -> None:
+    if not path.exists():
+        return
+    backup_path = path.with_name(f"{path.name}.bak")
+    shutil.copy2(path, backup_path)
+
+
 def host_entry_to_wizard(host: str, opts: Dict[str, str], folder: str) -> WizardData:
     identity = opts.get("identityfile", "")
     return WizardData(
@@ -647,13 +667,51 @@ def host_entry_to_wizard(host: str, opts: Dict[str, str], folder: str) -> Wizard
     )
 
 
+def merged_opts_from_wizard(
+    data: WizardData, prior: Optional[Dict[str, str]] = None
+) -> Dict[str, str]:
+    opts: Dict[str, str] = {
+        "hostname": data.hostname.strip() or data.host,
+        "user": data.user.strip(),
+        "port": data.port.strip() or str(DEFAULT_PORT),
+    }
+    if data.auth in (AUTH_KEY, AUTH_BOTH):
+        opts["identityfile"] = data.identity_file.strip() or DEFAULT_IDENTITY
+    if prior:
+        if prior.get("_vnssh_legacy") == "1":
+            opts["_vnssh_legacy"] = "1"
+        for key, value in prior.items():
+            if key.startswith("_") or not value or key in opts:
+                continue
+            opts[key] = value
+    return opts
+
+
 def format_parsed_host_block(host: str, opts: Dict[str, str], folder: str) -> str:
     block = format_host_block(host_entry_to_wizard(host, opts, folder))
-    if opts.get("_vnssh_legacy") != "1":
-        return block
     lines = block.splitlines()
-    if lines and lines[0].startswith(FOLDER_COMMENT_PREFIX):
+    if opts.get("_vnssh_legacy") == "1" and lines and lines[0].startswith(
+        FOLDER_COMMENT_PREFIX
+    ):
         lines.insert(1, LEGACY_COMMENT_PREFIX)
+
+    extra_lines: List[str] = []
+    for key, value in opts.items():
+        if key.startswith("_") or not value:
+            continue
+        if key.lower() in KNOWN_HOST_BLOCK_KEYS:
+            continue
+        extra_lines.append(f"    {key} {value}")
+
+    if extra_lines:
+        insert_at = len(lines)
+        for index, line in enumerate(lines):
+            if line.strip().lower().startswith("stricthostkeychecking"):
+                insert_at = index
+                break
+        for offset, extra in enumerate(extra_lines):
+            lines.insert(insert_at + offset, extra)
+
     return "\n".join(lines) + "\n"
 
 
@@ -661,6 +719,7 @@ def write_hosts_conf(
     entries: List[Tuple[str, Dict[str, str], str]], path: Path = HOSTS_CONF
 ) -> None:
     ensure_vnssh_dir()
+    backup_hosts_conf(path)
     parts = ["# Managed by vnssh"]
     for host, opts, folder in entries:
         parts.append(format_parsed_host_block(host, opts, folder).rstrip())
@@ -682,21 +741,42 @@ def remove_host_block(host: str, path: Path = HOSTS_CONF) -> bool:
 def upsert_host_block(data: WizardData) -> None:
     ensure_vnssh_dir()
     if data.original_host and data.original_host != data.host:
-        remove_host_block(data.original_host, HOSTS_CONF)
         if keychain_has(data.original_host):
             pw = keychain_get(data.original_host)
             if pw:
                 keychain_set(data.host, pw)
             keychain_delete(data.original_host)
         rename_history(data.original_host, data.host)
-    elif data.original_host:
-        remove_host_block(data.original_host, HOSTS_CONF)
 
-    block = format_host_block(data)
-    existing = read_config_text(HOSTS_CONF)
-    if existing and not existing.endswith("\n"):
-        existing += "\n"
-    HOSTS_CONF.write_text(existing + block, encoding="utf-8")
+    text = read_config_text(HOSTS_CONF)
+    entries = parse_config_entries(text)
+    remove_name = data.original_host or data.host
+
+    prior_opts: Optional[Dict[str, str]] = None
+    for host, opts, _folder in entries:
+        if host == remove_name:
+            prior_opts = opts
+            break
+
+    new_entry = (
+        data.host,
+        merged_opts_from_wizard(data, prior_opts),
+        normalize_folder(data.folder),
+    )
+
+    new_entries: List[Tuple[str, Dict[str, str], str]] = []
+    replaced = False
+    for host, opts, folder in entries:
+        if host == remove_name:
+            if not replaced:
+                new_entries.append(new_entry)
+                replaced = True
+            continue
+        new_entries.append((host, opts, folder))
+    if not replaced:
+        new_entries.append(new_entry)
+
+    write_hosts_conf(new_entries)
 
 
 # ---------------------------------------------------------------------------
