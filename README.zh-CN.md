@@ -11,7 +11,7 @@ macOS 上的 SSH 启动器：终端 TUI 搜主机、Keychain 存密码、支持 
 - **OpenSSH 集成**：自动维护 `~/.ssh/config` 的 `Include`，与现有配置共存
 - **2FA / 堡垒机**：`#v-2fa` 主机自动填密码，OTP 在终端手输
 - **老设备兼容**：算法不匹配时自动学习并写入 `#v-legacy`（也可手工预先配置）
-- **会话日志**：登录后的终端输出写入 `~/.vnssh/sessions/`（堡垒机二次登录会单独建目标机日志）
+- **会话日志**：登录后的终端输出写入 `~/.vnssh/sessions/`
 - **CSV 批量导入**：从表格一次性导入主机
 
 ## 环境要求
@@ -113,7 +113,6 @@ vnssh import vnssh-hosts-template.csv
 
 - 默认开启，目录：`~/.vnssh/sessions/`
 - 仅记录**登录成功后**的终端输出（不含 OTP 等认证阶段）
-- 腾讯云堡垒机：二次登录成功后会生成独立文件，形如 `目标IP_用户_via_堡垒机名_时间.session`
 - 关闭：`VNSSH_SESSION_LOG=0 vnssh`
 
 ## 安全说明

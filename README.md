@@ -11,7 +11,7 @@ macOS SSH launcher with a terminal UI, Keychain-backed passwords, 2FA bastion su
 - **OpenSSH integration** — manages `Include ~/.vnssh/hosts.conf` in `~/.ssh/config`
 - **2FA / bastion hosts** — auto-fill password via PTY; enter OTP in the terminal (`#v-2fa`)
 - **Legacy devices** — auto-learns `#v-legacy` after algorithm mismatch (or set it upfront)
-- **Session logs** — post-login terminal output under `~/.vnssh/sessions/` (nested bastion targets get separate files)
+- **Session logs** — post-login terminal output under `~/.vnssh/sessions/`
 - **CSV import** — bulk-add hosts from a spreadsheet
 
 ## Requirements
@@ -113,7 +113,6 @@ Columns (same order as the template):
 
 - Enabled by default; files under `~/.vnssh/sessions/`
 - Logs terminal output **after** login (not OTP/password prompts)
-- Tencent Cloud bastion: a separate log file is created per nested target login, e.g. `10.0.0.1_user_via_bastion-example_2026-06-25_120000.session`
 - Disable: `VNSSH_SESSION_LOG=0 vnssh`
 
 ## Security
