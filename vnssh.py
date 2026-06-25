@@ -32,10 +32,16 @@ INCLUDE_MARKER = "Include ~/.vnssh/hosts.conf"
 FOLDER_COMMENT_PREFIX = "#v-f:"
 FOLDER_UNCATEGORIZED = "Uncategorized"
 FOLDER_UNCATEGORIZED_ALIASES = frozenset({FOLDER_UNCATEGORIZED, "未分类"})
-COL_FOLDER_W = 12
-COL_HOST_W = 16
+COL_FOLDER_MIN = 12
+COL_FOLDER_MAX = 24
+COL_HOST_MIN = 16
+COL_HOST_MAX = 32
+COL_ADDR_MIN = 12
+COL_ADDR_MAX = 48
 COL_FLAGS_W = 9
 COL_PREFIX_W = 2
+TABLE_MAX_WIDTH = 120
+TABLE_GAPS = 3
 SEARCH_PREFIX = "> "
 SEARCH_CURSOR_BLINK_MS = 500
 DEFAULT_PORT = 22
@@ -855,24 +861,60 @@ def format_conn_flags(conn: Connection) -> str:
     return " ".join(parts) if parts else "-"
 
 
-def table_columns(term_width: int) -> Dict[str, int]:
-    margin = 1
-    inner = max(40, term_width - 2)
-    flags_w = COL_FLAGS_W
-    folder_w = COL_FOLDER_W
-    host_w = COL_HOST_W
-    gaps = 3
-    addr_w = inner - COL_PREFIX_W - folder_w - host_w - flags_w - gaps
-    addr_w = max(12, addr_w)
+def distribute_column_widths(flex_space: int) -> Tuple[int, int, int]:
+    """Split flex space across folder, host, and address with min/max caps."""
+    flex_min = COL_FOLDER_MIN + COL_HOST_MIN + COL_ADDR_MIN
+    flex_max = COL_FOLDER_MAX + COL_HOST_MAX + COL_ADDR_MAX
+    space = max(0, flex_space)
 
-    folder_x = margin + COL_PREFIX_W
+    if space <= flex_min:
+        folder_w = COL_FOLDER_MIN
+        host_w = COL_HOST_MIN
+        addr_w = max(0, space - folder_w - host_w)
+        return folder_w, host_w, addr_w
+
+    if space >= flex_max:
+        return COL_FOLDER_MAX, COL_HOST_MAX, COL_ADDR_MAX
+
+    ratio = (space - flex_min) / (flex_max - flex_min)
+    folder_w = COL_FOLDER_MIN + round(ratio * (COL_FOLDER_MAX - COL_FOLDER_MIN))
+    host_w = COL_HOST_MIN + round(ratio * (COL_HOST_MAX - COL_HOST_MIN))
+    folder_w = max(COL_FOLDER_MIN, min(COL_FOLDER_MAX, folder_w))
+    host_w = max(COL_HOST_MIN, min(COL_HOST_MAX, host_w))
+    addr_w = space - folder_w - host_w
+    if addr_w > COL_ADDR_MAX:
+        addr_w = COL_ADDR_MAX
+    elif addr_w < COL_ADDR_MIN:
+        addr_w = COL_ADDR_MIN
+        overflow = folder_w + host_w + addr_w - space
+        if overflow > 0:
+            host_cut = min(overflow, host_w - COL_HOST_MIN)
+            host_w -= host_cut
+            overflow -= host_cut
+        if overflow > 0:
+            folder_w = max(COL_FOLDER_MIN, folder_w - overflow)
+    return folder_w, host_w, addr_w
+
+
+def table_columns(term_width: int) -> Dict[str, int]:
+    usable = max(40, term_width - 2)
+    panel_w = min(usable, TABLE_MAX_WIDTH)
+    panel_x = 1 + max(0, (usable - panel_w) // 2)
+
+    flags_w = COL_FLAGS_W
+    fixed = COL_PREFIX_W + flags_w + TABLE_GAPS
+    flex_space = panel_w - fixed
+    folder_w, host_w, addr_w = distribute_column_widths(flex_space)
+    addr_w = flex_space - folder_w - host_w
+
+    folder_x = panel_x + COL_PREFIX_W
     host_x = folder_x + folder_w + 1
     addr_x = host_x + host_w + 1
-    flags_x = margin + inner - flags_w
+    flags_x = panel_x + panel_w - flags_w
 
     return {
-        "margin": margin,
-        "inner": inner,
+        "margin": panel_x,
+        "inner": panel_w,
         "folder_w": folder_w,
         "host_w": host_w,
         "addr_w": addr_w,
@@ -1486,8 +1528,9 @@ class MainUI:
         top_row = layout["input_top_row"]
         row = layout["input_row"]
         bottom_row = layout["input_bottom_row"]
-        left = 1
-        right = max(left + 2, width - 2)
+        cols = table_columns(width)
+        left = cols["margin"]
+        right = cols["margin"] + cols["inner"] - 1
         hline_len = max(0, right - left - 1)
         border_attr = curses.A_DIM
         focused = self.focus == "input"
@@ -1529,28 +1572,39 @@ class MainUI:
 
     def draw_status_bar(self, stdscr, layout: Dict[str, int], width: int) -> None:
         row = layout["status_row"]
+        cols = table_columns(width)
         status = self.status_text(layout)
         status_attr = curses.A_DIM
-        status_x = max(1, width - 2 - len(status))
+        status_x = cols["margin"] + cols["inner"] - len(status)
         safe_addstr(stdscr, row, status_x, status, status_attr)
 
         if self.message:
-            max_left = max(0, status_x - 2)
-            safe_addstr(stdscr, row, 1, self.message[:max_left], curses.color_pair(3))
+            max_left = max(0, status_x - cols["margin"] - 1)
+            safe_addstr(
+                stdscr,
+                row,
+                cols["margin"],
+                self.message[:max_left],
+                curses.color_pair(3),
+            )
 
     def draw_help_lines(self, stdscr, layout: Dict[str, int], width: int) -> None:
-        inner = max(0, width - 2)
+        cols = table_columns(width)
         for row, segments in zip(layout["help_rows"], layout["help_lines"]):
-            draw_help_segments(stdscr, row, 1, segments, inner)
+            draw_help_segments(stdscr, row, cols["margin"], segments, cols["inner"])
 
-    def draw_footer(self, stdscr, layout: Dict[str, int], width: int) -> None:
+    def draw_panel_rule(self, stdscr, row: int, width: int) -> None:
+        cols = table_columns(width)
         safe_addstr(
             stdscr,
-            layout["footer_sep_row"],
-            1,
-            ("-" * max(0, width - 2))[: max(0, width - 2)],
+            row,
+            cols["margin"],
+            ("-" * cols["inner"])[: cols["inner"]],
             curses.A_DIM,
         )
+
+    def draw_footer(self, stdscr, layout: Dict[str, int], width: int) -> None:
+        self.draw_panel_rule(stdscr, layout["footer_sep_row"], width)
         self.draw_status_bar(stdscr, layout, width)
         self.draw_input_box(stdscr, layout, width)
         self.draw_help_lines(stdscr, layout, width)
@@ -1564,14 +1618,7 @@ class MainUI:
         curses.curs_set(0)
 
         self.draw_table_header(stdscr, width)
-        sep_attr = curses.A_DIM
-        safe_addstr(
-            stdscr,
-            layout["sep_row"],
-            1,
-            ("-" * max(0, width - 2))[: max(0, width - 2)],
-            sep_attr,
-        )
+        self.draw_panel_rule(stdscr, layout["sep_row"], width)
 
         visible = self.visible_connections(layout)
         for idx, conn in enumerate(visible):
