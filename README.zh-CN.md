@@ -64,7 +64,7 @@ vnssh import --dry-run file.csv
 vnssh init          # 初始化 ~/.vnssh，并在当前目录生成导入模板 CSV
 ```
 
-`vnssh init` 会在**当前目录**生成 `vnssh-hosts-template.csv`（已存在则跳过）。编辑后执行 `vnssh import vnssh-hosts-template.csv` 即可导入。
+`vnssh init` 具有幂等性：若 `~/.vnssh/hosts.conf` 与 `~/.ssh/config` 中的 `Include` 行均已存在，则跳过初始化。会在**当前目录**生成 `vnssh-hosts-template.csv`（已存在则跳过）。编辑后执行 `vnssh import vnssh-hosts-template.csv` 即可导入。
 
 ## 配置文件
 
@@ -104,7 +104,7 @@ vnssh init
 vnssh import vnssh-hosts-template.csv
 ```
 
-列名：`host`, `folder`, `hostname`, `user`, `port`, `password`, `identity_file`, `auth`。
+列名：`Category`, `host`, `hostname`, `user`, `port`, `password`, `identity_file`, `auth`（也接受 `folder` / `group` 别名）。
 
 `auth` 取值：`password` / `key` / `both`（或 `1` / `2` / `3`）。
 

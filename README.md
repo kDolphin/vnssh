@@ -64,7 +64,7 @@ vnssh import --dry-run hosts.csv
 vnssh init          # setup ~/.vnssh + write vnssh-hosts-template.csv here
 ```
 
-`vnssh init` also writes `vnssh-hosts-template.csv` in the current directory (skipped if the file already exists). Edit it and run `vnssh import vnssh-hosts-template.csv`.
+`vnssh init` is idempotent: if `~/.vnssh/hosts.conf` and the `Include` line in `~/.ssh/config` already exist, setup is skipped. It also writes `vnssh-hosts-template.csv` in the current directory (skipped if the file already exists). Edit it and run `vnssh import vnssh-hosts-template.csv`.
 
 ## Configuration
 
@@ -104,7 +104,7 @@ vnssh init
 vnssh import vnssh-hosts-template.csv
 ```
 
-Columns: `host`, `folder`, `hostname`, `user`, `port`, `password`, `identity_file`, `auth`.
+Columns: `Category`, `host`, `hostname`, `user`, `port`, `password`, `identity_file`, `auth` (`folder` / `group` aliases accepted).
 
 `auth`: `password`, `key`, or `both` (also `1`, `2`, `3`).
 
