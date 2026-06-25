@@ -412,12 +412,14 @@ def parse_config_entries(text: str) -> List[Tuple[str, Dict[str, str], str]]:
     in_match = False
 
     def flush_hosts() -> None:
-        nonlocal current_legacy
+        nonlocal current_hosts, current_opts, current_legacy
         for h in current_hosts:
             opts = dict(current_opts)
             if current_legacy:
                 opts["_vnssh_legacy"] = "1"
             entries.append((h, opts, current_folder))
+        current_hosts = []
+        current_opts = {}
         current_legacy = False
 
     for raw_line in text.splitlines():
@@ -425,11 +427,14 @@ def parse_config_entries(text: str) -> List[Tuple[str, Dict[str, str], str]]:
         if not line:
             continue
         if line.startswith("#"):
-            if parse_legacy_comment(line):
-                current_legacy = True
             folder = parse_folder_comment(line)
             if folder is not None:
+                if current_hosts and not in_match:
+                    flush_hosts()
                 current_folder = normalize_folder(folder)
+                continue
+            if parse_legacy_comment(line):
+                current_legacy = True
             continue
         lower = line.lower()
         if lower.startswith("match "):
@@ -721,7 +726,7 @@ def write_hosts_conf(
     ensure_vnssh_dir()
     backup_hosts_conf(path)
     parts = ["# Managed by vnssh"]
-    for host, opts, folder in entries:
+    for host, opts, folder in dedupe_config_entries(entries):
         parts.append(format_parsed_host_block(host, opts, folder).rstrip())
     path.write_text("\n".join(parts) + "\n", encoding="utf-8")
 
@@ -776,7 +781,7 @@ def upsert_host_block(data: WizardData) -> None:
     if not replaced:
         new_entries.append(new_entry)
 
-    write_hosts_conf(new_entries)
+    write_hosts_conf(dedupe_config_entries(new_entries))
 
 
 # ---------------------------------------------------------------------------
@@ -2482,8 +2487,49 @@ def sync_folders_from_csv(rows: List[WizardData]) -> int:
             updated += 1
         new_entries.append((host, opts, new_folder))
     if updated:
-        write_hosts_conf(new_entries)
+        write_hosts_conf(dedupe_config_entries(new_entries))
     return updated
+
+
+def dedupe_config_entries(
+    entries: List[Tuple[str, Dict[str, str], str]],
+) -> List[Tuple[str, Dict[str, str], str]]:
+    """Keep the last occurrence of each Host alias."""
+    seen: set[str] = set()
+    deduped_reversed: List[Tuple[str, Dict[str, str], str]] = []
+    for host, opts, folder in reversed(entries):
+        if host in seen:
+            continue
+        seen.add(host)
+        deduped_reversed.append((host, opts, folder))
+    deduped_reversed.reverse()
+    return deduped_reversed
+
+
+def rebuild_hosts_from_csv(rows: List[WizardData]) -> None:
+    """Rebuild managed hosts.conf from CSV, preserving per-host opts when present."""
+    existing = {
+        host: (opts, folder)
+        for host, opts, folder in parse_config_entries(read_config_text(HOSTS_CONF))
+    }
+    csv_hosts = {data.host for data in rows}
+    entries: List[Tuple[str, Dict[str, str], str]] = []
+
+    for data in rows:
+        prior_opts = existing.get(data.host, ({}, FOLDER_UNCATEGORIZED))[0]
+        entries.append(
+            (
+                data.host,
+                merged_opts_from_wizard(data, prior_opts or None),
+                normalize_folder(data.folder),
+            )
+        )
+
+    for host, (opts, folder) in existing.items():
+        if host not in csv_hosts:
+            entries.append((host, opts, folder))
+
+    write_hosts_conf(dedupe_config_entries(entries))
 
 
 def read_import_csv(path: Path) -> List[WizardData]:
@@ -2533,11 +2579,6 @@ def cmd_import(argv: List[str]) -> None:
     ensure_include()
     rows = read_import_csv(csv_path)
 
-    if force and not dry_run:
-        fixed = sync_folders_from_csv(rows)
-        if fixed:
-            print(f"Synced folder tags for {fixed} host(s) from CSV")
-
     stats = {
         "add": 0,
         "update_managed": 0,
@@ -2548,24 +2589,34 @@ def cmd_import(argv: List[str]) -> None:
 
     prefix = "[dry-run] " if dry_run else ""
 
-    for data in rows:
-        action = import_wizard_data(data, force=force, dry_run=dry_run)
-
-        stats[action] = stats.get(action, 0) + 1
-
-        if action == "add":
-            print(f"{prefix}Added {data.host} -> {data.user}@{data.hostname}")
-        elif action == "update_managed":
+    if force and not dry_run:
+        rebuild_hosts_from_csv(rows)
+        for data in rows:
+            if data.auth in (AUTH_PASSWORD, AUTH_BOTH):
+                apply_keychain_password(data.host, data.password)
+            else:
+                keychain_delete(data.host)
+            stats["update_managed"] += 1
             print(f"{prefix}Updated {data.host}")
-        elif action == "keychain_ext":
-            print(f"{prefix}Keychain only [ext] {data.host}")
-        elif action == "skip_managed":
-            print(
-                f"{prefix}Skipped (exists in hosts.conf): {data.host} "
-                f"(use --force to overwrite)"
-            )
-        elif action == "skip_ext":
-            print(f"{prefix}Skipped [ext] {data.host} (no password column)")
+    else:
+        for data in rows:
+            action = import_wizard_data(data, force=force, dry_run=dry_run)
+
+            stats[action] = stats.get(action, 0) + 1
+
+            if action == "add":
+                print(f"{prefix}Added {data.host} -> {data.user}@{data.hostname}")
+            elif action == "update_managed":
+                print(f"{prefix}Updated {data.host}")
+            elif action == "keychain_ext":
+                print(f"{prefix}Keychain only [ext] {data.host}")
+            elif action == "skip_managed":
+                print(
+                    f"{prefix}Skipped (exists in hosts.conf): {data.host} "
+                    f"(use --force to overwrite)"
+                )
+            elif action == "skip_ext":
+                print(f"{prefix}Skipped [ext] {data.host} (no password column)")
 
     print(
         f"\n{prefix}Done: added {stats['add']}, "
