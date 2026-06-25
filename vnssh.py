@@ -35,7 +35,11 @@ KEYCHAIN_SERVICE = "vnssh"
 INCLUDE_MARKER = "Include ~/.vnssh/hosts.conf"
 FOLDER_COMMENT_PREFIX = "#v-f:"
 LEGACY_COMMENT_PREFIX = "#v-legacy"
-SSH_CONNECT_OPTIONS = (("StrictHostKeyChecking", "accept-new"),)
+SSH_CONNECT_OPTIONS = (
+    ("StrictHostKeyChecking", "accept-new"),
+    ("ConnectTimeout", "5"),
+)
+PROBE_CONNECT_TIMEOUT = 2
 LEGACY_SSH_OPTIONS = (
     (
         "KexAlgorithms",
@@ -1065,7 +1069,7 @@ def probe_algorithm_mismatch(host: str) -> bool:
         "-o",
         "BatchMode=yes",
         "-o",
-        "ConnectTimeout=5",
+        f"ConnectTimeout={PROBE_CONNECT_TIMEOUT}",
         "-o",
         "StrictHostKeyChecking=accept-new",
         "-o",
@@ -1167,16 +1171,9 @@ def run_ssh_with_tty(argv: List[str], env: Dict[str, str]) -> Tuple[int, str]:
     return 1, err_text
 
 
-def connect_host(
-    host: str, use_keychain: bool = True, exec_mode: bool = True
-) -> ConnectResult:
-    """Run ssh. exec_mode=True replaces process (CLI); TUI returns exit code."""
-    record_use(host)
-    legacy = host_legacy_enabled(host)
-    if not legacy and probe_algorithm_mismatch(host):
-        persist_legacy_host(host)
-        legacy = True
-
+def prepare_ssh_invocation(
+    host: str, *, legacy: bool, use_keychain: bool
+) -> Tuple[List[str], Dict[str, str], bool]:
     ssh_args = build_ssh_argv(host, legacy=legacy)
     env = os.environ.copy()
     use_askpass = use_keychain and keychain_has(host)
@@ -1186,16 +1183,48 @@ def connect_host(
         for var in ("SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "VNSSH_HOST"):
             env.pop(var, None)
         ssh_args.insert(1, "-tt")
+    return ssh_args, env, use_askpass
 
+
+def run_ssh_session(
+    ssh_args: List[str], env: Dict[str, str], use_askpass: bool, exec_mode: bool
+) -> ConnectResult:
     if exec_mode:
         os.execvpe("ssh", ssh_args, env)
-
     if use_askpass:
         proc = subprocess.run(ssh_args, env=env, stderr=subprocess.PIPE, text=True)
-        stderr = (proc.stderr or "").strip()
-        return ConnectResult(proc.returncode, stderr=stderr)
+        return ConnectResult(proc.returncode, stderr=(proc.stderr or "").strip())
     returncode, stderr = run_ssh_with_tty(ssh_args, env)
     return ConnectResult(returncode, stderr=stderr)
+
+
+def connect_host(
+    host: str, use_keychain: bool = True, exec_mode: bool = True
+) -> ConnectResult:
+    """Run ssh. exec_mode=True replaces process (CLI); TUI returns exit code."""
+    record_use(host)
+    legacy = host_legacy_enabled(host)
+
+    if exec_mode:
+        if not legacy and probe_algorithm_mismatch(host):
+            persist_legacy_host(host)
+            legacy = True
+        ssh_args, env, use_askpass = prepare_ssh_invocation(
+            host, legacy=legacy, use_keychain=use_keychain
+        )
+        run_ssh_session(ssh_args, env, use_askpass, exec_mode=True)
+
+    ssh_args, env, use_askpass = prepare_ssh_invocation(
+        host, legacy=legacy, use_keychain=use_keychain
+    )
+    result = run_ssh_session(ssh_args, env, use_askpass, exec_mode=False)
+    if not legacy and ssh_algorithm_mismatch(result):
+        persist_legacy_host(host)
+        ssh_args, env, use_askpass = prepare_ssh_invocation(
+            host, legacy=True, use_keychain=use_keychain
+        )
+        result = run_ssh_session(ssh_args, env, use_askpass, exec_mode=False)
+    return result
 
 
 def apply_keychain_password(host: str, password: str) -> None:
