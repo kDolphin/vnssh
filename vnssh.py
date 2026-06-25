@@ -1081,29 +1081,60 @@ def askpass_env(host: str, base: Optional[Dict[str, str]] = None) -> Dict[str, s
     return env
 
 
-_BENIGN_SSH_OUTPUT = (
-    re.compile(r"^Connection to .+ closed\.?$", re.IGNORECASE),
+_CONNECTION_TO_CLOSED = re.compile(
+    r"^Connection to .+ closed(\s+by remote host)?\.?$", re.IGNORECASE
+)
+
+_DISCONNECT_LINE = (
+    _CONNECTION_TO_CLOSED,
     re.compile(r"^Shared connection to .+ closed\.?$", re.IGNORECASE),
+    re.compile(r"^Connection closed by .+ port \d+", re.IGNORECASE),
+    re.compile(r"^Disconnected from .+ port \d+", re.IGNORECASE),
 )
 
 
-def is_benign_ssh_output(err: str) -> bool:
-    """True when captured SSH output only reflects a normal session ending."""
+def is_ssh_noise_line(line: str) -> bool:
+    lower = line.lower()
+    if line.startswith("Warning:") or line.startswith("**"):
+        return True
+    if "post-quantum key exchange" in lower:
+        return True
+    if "Pseudo-terminal will not be allocated" in line:
+        return True
+    return False
+
+
+def is_disconnect_line(line: str) -> bool:
+    return any(pattern.search(line) for pattern in _DISCONNECT_LINE)
+
+
+def is_normal_ssh_disconnect(err: str) -> bool:
+    """Detect normal logout from the last substantive line SSH prints."""
     lines = [line.strip() for line in err.splitlines() if line.strip()]
     if not lines:
         return True
-    for line in lines:
-        lower = line.lower()
-        if line.startswith("Warning:") or line.startswith("** WARNING:"):
-            continue
-        if "post-quantum key exchange" in lower:
-            continue
-        if "Pseudo-terminal will not be allocated" in line:
-            continue
-        if any(pattern.search(line) for pattern in _BENIGN_SSH_OUTPUT):
-            continue
+    kept = [line for line in lines if not is_ssh_noise_line(line)]
+    if not kept:
+        return True
+    last = kept[-1]
+    # Printed after an interactive logout; not a connect-time failure.
+    if _CONNECTION_TO_CLOSED.search(last):
+        return True
+    if not is_disconnect_line(last):
         return False
-    return True
+    # Other disconnect lines are normal only when a shell session actually ran
+    # (PTY scrollback). With no session output they usually mean wrong port/VPN.
+    session_lines = [line for line in kept[:-1] if not is_disconnect_line(line)]
+    return bool(session_lines)
+
+
+def connect_failure_snippet(err: str) -> str:
+    """Prefer the last non-noise lines for status-bar errors (ignore shell scrollback)."""
+    lines = [line.strip() for line in err.splitlines() if line.strip()]
+    kept = [line for line in lines if not is_ssh_noise_line(line)]
+    if not kept:
+        return err.strip()
+    return "\n".join(kept[-3:])
 
 
 def should_report_connect_error(result: ConnectResult) -> bool:
@@ -1112,11 +1143,14 @@ def should_report_connect_error(result: ConnectResult) -> bool:
         return False
     if result.returncode == 130:
         return False
-    return not is_benign_ssh_output((result.stderr or "").strip())
+    err = (result.stderr or "").strip()
+    if is_normal_ssh_disconnect(err):
+        return False
+    return bool(connect_failure_snippet(err))
 
 
 def format_connect_error(host: str, result: ConnectResult) -> str:
-    err = (result.stderr or "").strip()
+    err = connect_failure_snippet((result.stderr or "").strip())
 
     if "Permission denied" in err:
         if not keychain_has(host):
