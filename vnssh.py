@@ -1043,42 +1043,62 @@ def probe_algorithm_mismatch(host: str) -> bool:
     return ssh_algorithm_mismatch(ConnectResult(proc.returncode, proc.stderr))
 
 
+def open_controlling_tty() -> Optional[int]:
+    """Return a fd for the real terminal (works after curses endwin)."""
+    try:
+        return os.open("/dev/tty", os.O_RDWR)
+    except OSError:
+        return None
+
+
 def prepare_terminal_for_shell() -> None:
     """Restore canonical terminal mode after curses endwin()."""
-    if not sys.stdin.isatty():
-        return
-    fd = sys.stdin.fileno()
-    attrs = termios.tcgetattr(fd)
-    attrs[3] |= termios.ICANON | termios.ECHO
-    attrs[3] &= ~termios.NOFLSH
-    termios.tcsetattr(fd, termios.TCSADRAIN, attrs)
-
-
-def sync_pty_window_size(master_fd: int) -> None:
-    if not sys.stdin.isatty():
+    tty_fd = open_controlling_tty()
+    fd = tty_fd if tty_fd is not None else sys.stdin.fileno()
+    if tty_fd is None and not sys.stdin.isatty():
         return
     try:
-        buf = fcntl.ioctl(sys.stdin, termios.TIOCGWINSZ, b"\0" * 8)
+        attrs = termios.tcgetattr(fd)
+        attrs[3] |= termios.ICANON | termios.ECHO
+        attrs[3] &= ~termios.NOFLSH
+        termios.tcsetattr(fd, termios.TCSADRAIN, attrs)
+    except (OSError, termios.error):
+        pass
+    finally:
+        if tty_fd is not None:
+            os.close(tty_fd)
+
+
+def sync_pty_window_size(master_fd: int, tty_fd: int) -> None:
+    try:
+        buf = fcntl.ioctl(tty_fd, termios.TIOCGWINSZ, b"\0" * 8)
         fcntl.ioctl(master_fd, termios.TIOCSWINSZ, buf)
     except OSError:
         pass
 
 
 def run_ssh_with_tty(argv: List[str], env: Dict[str, str]) -> int:
-    """Run ssh on a pty so password prompts work after curses."""
-    if not sys.stdin.isatty():
+    """Run ssh on a pty; relay via /dev/tty so prompts work after curses."""
+    tty_fd = open_controlling_tty()
+    if tty_fd is None and not sys.stdin.isatty():
         return subprocess.call(argv, env=env)
 
     pid, master_fd = pty.fork()
     if pid == 0:
+        if tty_fd is not None:
+            os.close(tty_fd)
         os.execvpe(argv[0], argv, env)
 
-    sync_pty_window_size(master_fd)
-    stdin_fd = sys.stdin.fileno()
-    stdout_fd = sys.stdout.fileno()
+    if tty_fd is not None:
+        sync_pty_window_size(master_fd, tty_fd)
+        terminal_fd = tty_fd
+    else:
+        terminal_fd = sys.stdin.fileno()
+        tty_fd = None
+
     try:
         while True:
-            readable, _, _ = select.select([master_fd, stdin_fd], [], [])
+            readable, _, _ = select.select([master_fd, terminal_fd], [], [])
             if master_fd in readable:
                 try:
                     data = os.read(master_fd, 8192)
@@ -1086,16 +1106,18 @@ def run_ssh_with_tty(argv: List[str], env: Dict[str, str]) -> int:
                     break
                 if not data:
                     break
-                os.write(stdout_fd, data)
-            if stdin_fd in readable:
+                os.write(terminal_fd, data)
+            if terminal_fd in readable:
                 try:
-                    data = os.read(stdin_fd, 8192)
+                    data = os.read(terminal_fd, 8192)
                 except OSError:
                     break
                 if not data:
                     break
                 os.write(master_fd, data)
     finally:
+        if tty_fd is not None:
+            os.close(tty_fd)
         os.close(master_fd)
         _, status = os.waitpid(pid, 0)
 
