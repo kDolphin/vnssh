@@ -1489,40 +1489,44 @@ class MainUI:
         bottom_row = layout["input_bottom_row"]
         left = 1
         right = max(left + 2, width - 2)
-        box_inner = max(0, right - left - 1)
+        hline_len = max(0, right - left - 1)
         border_attr = curses.A_DIM
         focused = self.focus == "input"
 
         if right > left + 1:
             safe_addch(stdscr, top_row, left, curses.ACS_ULCORNER, border_attr)
-            stdscr.hline(top_row, left + 1, curses.ACS_HLINE, box_inner - 1, border_attr)
+            if hline_len:
+                stdscr.hline(top_row, left + 1, curses.ACS_HLINE, hline_len, border_attr)
             safe_addch(stdscr, top_row, right, curses.ACS_URCORNER, border_attr)
 
             safe_addch(stdscr, row, left, curses.ACS_VLINE, border_attr)
-            safe_addch(stdscr, row, right, curses.ACS_VLINE, border_attr)
 
             safe_addch(stdscr, bottom_row, left, curses.ACS_LLCORNER, border_attr)
-            stdscr.hline(bottom_row, left + 1, curses.ACS_HLINE, box_inner - 1, border_attr)
+            if hline_len:
+                stdscr.hline(bottom_row, left + 1, curses.ACS_HLINE, hline_len, border_attr)
             safe_addch(stdscr, bottom_row, right, curses.ACS_LRCORNER, border_attr)
 
         content_x = left + 2
-        content_w = max(0, right - content_x - 1)
+        content_w = max(0, right - content_x)
         safe_addstr(stdscr, row, content_x, SEARCH_PREFIX, input_prompt_attr(focused))
         x = content_x + len(SEARCH_PREFIX)
+        max_query = max(0, content_w - len(SEARCH_PREFIX))
         if self.query:
             safe_addstr(
                 stdscr,
                 row,
                 x,
-                self.query[: max(0, content_w - len(SEARCH_PREFIX))],
+                self.query[:max_query],
                 input_query_attr(focused),
             )
-            x += len(self.query)
+            x += min(len(self.query), max_query)
         if focused and self._blink_on and x < right:
-            cursor_char = " "
-            safe_addstr(stdscr, row, x, cursor_char, curses.A_REVERSE)
-        elif not self.query and not focused:
+            safe_addstr(stdscr, row, x, " ", curses.A_REVERSE)
+        elif not self.query and not focused and x < right:
             safe_addstr(stdscr, row, x, " ", help_desc_attr())
+
+        if right > left + 1:
+            safe_addch(stdscr, row, right, curses.ACS_VLINE, border_attr)
 
     def draw_status_bar(self, stdscr, layout: Dict[str, int], width: int) -> None:
         row = layout["status_row"]
