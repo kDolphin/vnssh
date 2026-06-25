@@ -36,11 +36,11 @@ COL_FOLDER_W = 12
 COL_HOST_W = 16
 COL_FLAGS_W = 9
 COL_PREFIX_W = 2
-SEARCH_PREFIX = "/ "
+SEARCH_PREFIX = "> "
 SEARCH_CURSOR_BLINK_MS = 500
 DEFAULT_PORT = 22
 DEFAULT_IDENTITY = "~/.ssh/id_ed25519"
-MIN_TERMINAL_HEIGHT = 14
+MIN_TERMINAL_HEIGHT = 16
 MIN_PAGE_SIZE = 3
 HELP_HINTS: List[Tuple[str, str]] = [
     ("Enter", "connect"),
@@ -894,13 +894,26 @@ def safe_addstr(win, y: int, x: int, text: str, attr: int = 0) -> None:
 
 
 def help_key_attr() -> int:
-    if curses.has_colors():
-        return curses.color_pair(2) | curses.A_BOLD
     return curses.A_BOLD
 
 
 def help_desc_attr() -> int:
     return curses.A_DIM
+
+
+def input_prompt_attr(focused: bool) -> int:
+    return curses.A_BOLD if focused else curses.A_DIM
+
+
+def input_query_attr(focused: bool) -> int:
+    return curses.A_BOLD if focused else curses.A_DIM
+
+
+def safe_addch(win, y: int, x: int, ch, attr: int = 0) -> None:
+    height, width = win.getmaxyx()
+    if y < 0 or y >= height or x < 0 or x >= width:
+        return
+    win.addch(y, x, ch, attr)
 
 
 def help_line_display_width(segments: List[Tuple[str, str]]) -> int:
@@ -1309,8 +1322,10 @@ class MainUI:
         help_rows = help_lines_for_width(width)
         help_count = len(help_rows)
         help_start = height - help_count
-        input_row = help_start - 1
-        status_row = input_row - 1
+        input_bottom_row = help_start - 1
+        input_row = input_bottom_row - 1
+        input_top_row = input_row - 1
+        status_row = input_top_row - 1
         footer_sep_row = status_row - 1
         header_row = 1
         sep_row = 2
@@ -1320,7 +1335,9 @@ class MainUI:
         return {
             "help_rows": list(range(help_start, height)),
             "help_lines": help_rows,
+            "input_top_row": input_top_row,
             "input_row": input_row,
+            "input_bottom_row": input_bottom_row,
             "status_row": status_row,
             "footer_sep_row": footer_sep_row,
             "header_row": header_row,
@@ -1467,36 +1484,45 @@ class MainUI:
         )
 
     def draw_input_box(self, stdscr, layout: Dict[str, int], width: int) -> None:
+        top_row = layout["input_top_row"]
         row = layout["input_row"]
-        inner_w = max(0, width - 4)
-        border = curses.A_DIM
-        safe_addstr(stdscr, row, 1, "|", border)
-        safe_addstr(stdscr, row, width - 2, "|", border)
+        bottom_row = layout["input_bottom_row"]
+        left = 1
+        right = max(left + 2, width - 2)
+        box_inner = max(0, right - left - 1)
+        border_attr = curses.A_DIM
+        focused = self.focus == "input"
 
-        if self.focus == "input":
-            prefix_attr = help_key_attr()
-            query_attr = help_key_attr()
-        else:
-            prefix_attr = help_desc_attr()
-            query_attr = help_desc_attr()
+        if right > left + 1:
+            safe_addch(stdscr, top_row, left, curses.ACS_ULCORNER, border_attr)
+            stdscr.hline(top_row, left + 1, curses.ACS_HLINE, box_inner - 1, border_attr)
+            safe_addch(stdscr, top_row, right, curses.ACS_URCORNER, border_attr)
 
-        x = 2
-        safe_addstr(stdscr, row, x, SEARCH_PREFIX, prefix_attr)
-        x += len(SEARCH_PREFIX)
+            safe_addch(stdscr, row, left, curses.ACS_VLINE, border_attr)
+            safe_addch(stdscr, row, right, curses.ACS_VLINE, border_attr)
+
+            safe_addch(stdscr, bottom_row, left, curses.ACS_LLCORNER, border_attr)
+            stdscr.hline(bottom_row, left + 1, curses.ACS_HLINE, box_inner - 1, border_attr)
+            safe_addch(stdscr, bottom_row, right, curses.ACS_LRCORNER, border_attr)
+
+        content_x = left + 2
+        content_w = max(0, right - content_x - 1)
+        safe_addstr(stdscr, row, content_x, SEARCH_PREFIX, input_prompt_attr(focused))
+        x = content_x + len(SEARCH_PREFIX)
         if self.query:
             safe_addstr(
                 stdscr,
                 row,
                 x,
-                self.query[: max(0, inner_w - len(SEARCH_PREFIX))],
-                query_attr,
+                self.query[: max(0, content_w - len(SEARCH_PREFIX))],
+                input_query_attr(focused),
             )
             x += len(self.query)
-        if self.focus == "input" and self._blink_on and x < width - 2:
-            cursor_char = "_" if not self.query else "|"
-            safe_addstr(stdscr, row, x, cursor_char, query_attr | curses.A_REVERSE)
-        elif not self.query and self.focus != "input":
-            safe_addstr(stdscr, row, x, "_", help_desc_attr())
+        if focused and self._blink_on and x < right:
+            cursor_char = " "
+            safe_addstr(stdscr, row, x, cursor_char, curses.A_REVERSE)
+        elif not self.query and not focused:
+            safe_addstr(stdscr, row, x, " ", help_desc_attr())
 
     def draw_status_bar(self, stdscr, layout: Dict[str, int], width: int) -> None:
         row = layout["status_row"]
