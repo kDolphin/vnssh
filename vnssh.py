@@ -15,9 +15,11 @@ import re
 import select
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import termios
+import tty
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -1282,6 +1284,15 @@ def sync_pty_window_size(master_fd: int, tty_fd: int) -> None:
         pass
 
 
+def restore_tty_attrs(fd: int, attrs: Optional[List]) -> None:
+    if attrs is None:
+        return
+    try:
+        termios.tcsetattr(fd, termios.TCSADRAIN, attrs)
+    except (OSError, termios.error):
+        pass
+
+
 def run_ssh_with_tty(argv: List[str], env: Dict[str, str]) -> Tuple[int, str]:
     """Run ssh on a pty; relay via /dev/tty so prompts work after curses."""
     tty_fd = open_controlling_tty()
@@ -1304,9 +1315,23 @@ def run_ssh_with_tty(argv: List[str], env: Dict[str, str]) -> Tuple[int, str]:
         terminal_fd = sys.stdin.fileno()
         tty_fd = None
 
+    saved_tty: Optional[List] = None
+    resize_pending = False
+    old_winch = signal.SIG_DFL
+
+    def on_winch(signum: int, frame: Optional[object]) -> None:
+        nonlocal resize_pending
+        resize_pending = True
+
     try:
+        saved_tty = termios.tcgetattr(terminal_fd)
+        tty.setraw(terminal_fd, termios.TCSADRAIN)
+        old_winch = signal.signal(signal.SIGWINCH, on_winch)
         while True:
-            readable, _, _ = select.select([master_fd, terminal_fd], [], [])
+            if resize_pending:
+                resize_pending = False
+                sync_pty_window_size(master_fd, terminal_fd)
+            readable, _, _ = select.select([master_fd, terminal_fd], [], [], 0.2)
             if master_fd in readable:
                 try:
                     data = os.read(master_fd, 8192)
@@ -1325,6 +1350,8 @@ def run_ssh_with_tty(argv: List[str], env: Dict[str, str]) -> Tuple[int, str]:
                     break
                 os.write(master_fd, data)
     finally:
+        signal.signal(signal.SIGWINCH, old_winch)
+        restore_tty_attrs(terminal_fd, saved_tty)
         if tty_fd is not None:
             os.close(tty_fd)
         os.close(master_fd)
@@ -1358,10 +1385,10 @@ def run_ssh_session(
 ) -> ConnectResult:
     if exec_mode:
         os.execvpe("ssh", ssh_args, env)
-    if use_askpass:
-        proc = subprocess.run(ssh_args, env=env, stderr=subprocess.PIPE, text=True)
-        return ConnectResult(proc.returncode, stderr=(proc.stderr or "").strip())
-    returncode, stderr = run_ssh_with_tty(ssh_args, env)
+    args = list(ssh_args)
+    if use_askpass and "-tt" not in args:
+        args.insert(1, "-tt")
+    returncode, stderr = run_ssh_with_tty(args, env)
     return ConnectResult(returncode, stderr=stderr)
 
 
