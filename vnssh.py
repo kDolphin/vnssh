@@ -30,6 +30,22 @@ SSH_CONFIG = Path.home() / ".ssh" / "config"
 KEYCHAIN_SERVICE = "vnssh"
 INCLUDE_MARKER = "Include ~/.vnssh/hosts.conf"
 FOLDER_COMMENT_PREFIX = "#v-f:"
+LEGACY_COMMENT_PREFIX = "#v-legacy"
+LEGACY_HOST_MARKERS = ("路由器", "交换机", "2960", "3650", "带外")
+LEGACY_SSH_OPTIONS = (
+    (
+        "KexAlgorithms",
+        "+diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha1,"
+        "diffie-hellman-group1-sha1",
+    ),
+    ("HostKeyAlgorithms", "+ssh-rsa"),
+    ("PubkeyAcceptedAlgorithms", "+ssh-rsa"),
+    (
+        "Ciphers",
+        "+aes128-ctr,aes192-ctr,aes256-ctr,aes128-cbc,aes192-cbc,aes256-cbc,3des-cbc",
+    ),
+    ("MACs", "+hmac-sha1,hmac-sha1-96,hmac-sha2-256,hmac-md5,hmac-md5-96"),
+)
 FOLDER_UNCATEGORIZED = "Uncategorized"
 FOLDER_UNCATEGORIZED_ALIASES = frozenset({FOLDER_UNCATEGORIZED, "未分类"})
 COL_FOLDER_MIN = 12
@@ -351,6 +367,13 @@ def parse_folder_comment(line: str) -> Optional[str]:
     return None
 
 
+def parse_legacy_comment(line: str) -> bool:
+    stripped = line.strip()
+    return stripped == LEGACY_COMMENT_PREFIX or stripped.startswith(
+        f"{LEGACY_COMMENT_PREFIX}:"
+    )
+
+
 def is_uncategorized_folder(folder: str) -> bool:
     value = folder.strip()
     return not value or value in FOLDER_UNCATEGORIZED_ALIASES
@@ -369,13 +392,25 @@ def parse_config_entries(text: str) -> List[Tuple[str, Dict[str, str], str]]:
     current_hosts: List[str] = []
     current_opts: Dict[str, str] = {}
     current_folder = FOLDER_UNCATEGORIZED
+    current_legacy = False
     in_match = False
+
+    def flush_hosts() -> None:
+        nonlocal current_legacy
+        for h in current_hosts:
+            opts = dict(current_opts)
+            if current_legacy:
+                opts["_vnssh_legacy"] = "1"
+            entries.append((h, opts, current_folder))
+        current_legacy = False
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
             continue
         if line.startswith("#"):
+            if parse_legacy_comment(line):
+                current_legacy = True
             folder = parse_folder_comment(line)
             if folder is not None:
                 current_folder = normalize_folder(folder)
@@ -383,8 +418,7 @@ def parse_config_entries(text: str) -> List[Tuple[str, Dict[str, str], str]]:
         lower = line.lower()
         if lower.startswith("match "):
             if current_hosts and not in_match:
-                for h in current_hosts:
-                    entries.append((h, dict(current_opts), current_folder))
+                flush_hosts()
             current_hosts = []
             current_opts = {}
             in_match = True
@@ -393,8 +427,7 @@ def parse_config_entries(text: str) -> List[Tuple[str, Dict[str, str], str]]:
             continue
         if lower.startswith("host "):
             if current_hosts:
-                for h in current_hosts:
-                    entries.append((h, dict(current_opts), current_folder))
+                flush_hosts()
             parts = shlex.split(line)
             current_hosts = parts[1:] if len(parts) > 1 else []
             current_opts = {}
@@ -407,8 +440,7 @@ def parse_config_entries(text: str) -> List[Tuple[str, Dict[str, str], str]]:
                 current_opts[key] = value
 
     if current_hosts and not in_match:
-        for h in current_hosts:
-            entries.append((h, dict(current_opts), current_folder))
+        flush_hosts()
 
     return entries
 
@@ -740,7 +772,7 @@ def sorted_connections(connections: List[Connection], query: str) -> List[Connec
 
 def askpass_program() -> str:
     """Absolute path used as SSH_ASKPASS (OpenSSH execs this directly)."""
-    return str(Path(sys.argv[0]).resolve())
+    return str(Path(__file__).resolve())
 
 
 def is_askpass_mode() -> bool:
@@ -783,6 +815,21 @@ def is_valid_ssh_host_argument(name: str) -> bool:
     return True
 
 
+def host_needs_legacy_ssh(host: str, opts: Dict[str, str]) -> bool:
+    if opts.get("_vnssh_legacy") == "1":
+        return True
+    return any(marker in host for marker in LEGACY_HOST_MARKERS)
+
+
+def legacy_ssh_args(host: str, opts: Dict[str, str]) -> List[str]:
+    if not host_needs_legacy_ssh(host, opts):
+        return []
+    args: List[str] = []
+    for key, value in LEGACY_SSH_OPTIONS:
+        args.extend(["-o", f"{key}={value}"])
+    return args
+
+
 def resolve_ssh_endpoint(host: str) -> Tuple[str, List[str]]:
     """Map a config Host alias to an ssh target and extra CLI args."""
     raw = gather_raw_hosts()
@@ -811,6 +858,9 @@ def resolve_ssh_endpoint(host: str) -> Tuple[str, List[str]]:
 
 def build_ssh_argv(host: str) -> List[str]:
     args = ["ssh"]
+    raw = gather_raw_hosts()
+    entry = raw.get(host)
+    opts = entry[0] if entry else {}
     mode = connection_auth_mode(host)
     if mode == AUTH_PASSWORD and keychain_has(host):
         args.extend(
@@ -821,6 +871,7 @@ def build_ssh_argv(host: str) -> List[str]:
                 "PubkeyAuthentication=no",
             ]
         )
+    args.extend(legacy_ssh_args(host, opts))
     target, extra = resolve_ssh_endpoint(host)
     args.extend(extra)
     args.append(target)
