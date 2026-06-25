@@ -1340,6 +1340,12 @@ class MainUI:
             return None
         if ch in (curses.KEY_DOWN,):
             return None
+        if ch in (curses.KEY_PPAGE, 2):  # PgUp, Ctrl-B
+            self.page_scroll(-1)
+            return None
+        if ch in (curses.KEY_NPAGE, 6):  # PgDn, Ctrl-F
+            self.page_scroll(1)
+            return None
         if ch in (ord("n"), ord("N")):
             return "new"
         if ch in (10, 13, curses.KEY_ENTER):
