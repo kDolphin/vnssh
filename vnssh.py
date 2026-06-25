@@ -12,6 +12,7 @@ import json
 import os
 import pty
 import re
+import secrets
 import select
 import shlex
 import shutil
@@ -19,6 +20,7 @@ import signal
 import subprocess
 import sys
 import termios
+import time
 import tty
 import unicodedata
 from dataclasses import dataclass, field
@@ -31,6 +33,8 @@ from typing import Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 
 VNSSH_DIR = Path.home() / ".vnssh"
+VNSSH_TERMINAL_TITLE = "vnssh"
+SESSIONS_DIR = VNSSH_DIR / "sessions"
 HOSTS_CONF = VNSSH_DIR / "hosts.conf"
 HISTORY_FILE = VNSSH_DIR / "history.json"
 SSH_CONFIG = Path.home() / ".ssh" / "config"
@@ -38,6 +42,8 @@ KEYCHAIN_SERVICE = "vnssh"
 INCLUDE_MARKER = "Include ~/.vnssh/hosts.conf"
 FOLDER_COMMENT_PREFIX = "#v-f:"
 LEGACY_COMMENT_PREFIX = "#v-legacy"
+TWOFA_COMMENT_PREFIX = "#v-2fa"
+_DEPRECATED_TWOFA_COMMENT_PREFIX = "#v-bastion"
 SSH_CONNECT_OPTIONS = (
     ("StrictHostKeyChecking", "accept-new"),
     ("ConnectTimeout", "5"),
@@ -58,7 +64,7 @@ LEGACY_SSH_OPTIONS = (
     ("MACs", "+hmac-sha1,hmac-sha1-96,hmac-sha2-256,hmac-md5,hmac-md5-96"),
 )
 FOLDER_UNCATEGORIZED = "Uncategorized"
-FOLDER_UNCATEGORIZED_ALIASES = frozenset({FOLDER_UNCATEGORIZED, "未分类"})
+FOLDER_UNCATEGORIZED_ALIASES = frozenset({FOLDER_UNCATEGORIZED})
 COL_FOLDER_MIN = 12
 COL_FOLDER_MAX = 24
 COL_HOST_MIN = 16
@@ -99,31 +105,20 @@ AUTH_LABELS = {
 }
 
 IMPORT_COLUMNS = {
-    "host": ("host", "name", "alias", "session_name", "名字", "名称", "连接名"),
-    "folder": ("folder", "分组", "目录", "分类"),
-    "hostname": (
-        "hostname",
-        "host_name",
-        "ip",
-        "address",
-        "addr",
-        "域名",
-        "地址",
-        "主机",
-    ),
-    "user": ("user", "username", "account", "帐号", "账号", "用户"),
-    "port": ("port", "端口"),
-    "password": ("password", "pass", "pwd", "密码"),
+    "host": ("host", "name", "alias", "session_name"),
+    "folder": ("folder", "group", "category"),
+    "hostname": ("hostname", "host_name", "ip", "address", "addr"),
+    "user": ("user", "username", "account"),
+    "port": ("port",),
+    "password": ("password", "pass", "pwd"),
     "identity_file": (
         "identity_file",
         "identityfile",
         "key",
         "keyfile",
         "private_key",
-        "密钥",
-        "密钥路径",
     ),
-    "auth": ("auth", "认证", "认证方式"),
+    "auth": ("auth", "authentication"),
 }
 
 
@@ -253,7 +248,7 @@ def invalidate_keychain_cache() -> None:
 
 
 def parse_keychain_acct(block: str) -> Optional[str]:
-    """Parse account name from a dump-keychain genp block."""
+    """Parse account name from a single dump-keychain genp attributes block."""
     match = re.search(r'"acct"<blob>="([^"]+)"', block)
     if match:
         return match.group(1)
@@ -265,6 +260,21 @@ def parse_keychain_acct(block: str) -> Optional[str]:
         except (ValueError, UnicodeDecodeError):
             return None
     return None
+
+
+def _vnssh_genp_section(entry: str) -> Optional[str]:
+    """Return the attributes block for one vnssh generic-password item."""
+    if 'class: "genp"' not in entry:
+        return None
+    genp = entry.split('class: "genp"', 1)[1]
+    genp = re.split(r'\nclass: "', genp, maxsplit=1)[0]
+    if not re.search(
+        rf'(?:"svce"<blob>="{re.escape(KEYCHAIN_SERVICE)}"'
+        rf'|0x00000007 <blob>="{re.escape(KEYCHAIN_SERVICE)}")',
+        genp,
+    ):
+        return None
+    return genp
 
 
 def load_keychain_accounts() -> set[str]:
@@ -283,10 +293,13 @@ def load_keychain_accounts() -> set[str]:
             timeout=30,
         )
         if proc.returncode == 0:
-            for block in re.split(r'class: "genp"', proc.stdout)[1:]:
-                if KEYCHAIN_SERVICE not in block:
+            # Split per keychain item. Splitting only on class:"genp" merges many
+            # unrelated entries and breaks non-ASCII account names stored as hex.
+            for entry in re.split(r"\nkeychain:", proc.stdout):
+                genp = _vnssh_genp_section(entry)
+                if genp is None:
                     continue
-                account = parse_keychain_acct(block)
+                account = parse_keychain_acct(genp)
                 if account:
                     accounts.add(account)
 
@@ -392,6 +405,17 @@ def parse_legacy_comment(line: str) -> bool:
     )
 
 
+def parse_twofa_comment(line: str) -> bool:
+    stripped = line.strip()
+    if stripped == _DEPRECATED_TWOFA_COMMENT_PREFIX or stripped.startswith(
+        f"{_DEPRECATED_TWOFA_COMMENT_PREFIX}:"
+    ):
+        return True
+    return stripped == TWOFA_COMMENT_PREFIX or stripped.startswith(
+        f"{TWOFA_COMMENT_PREFIX}:"
+    )
+
+
 def is_uncategorized_folder(folder: str) -> bool:
     value = folder.strip()
     return not value or value in FOLDER_UNCATEGORIZED_ALIASES
@@ -411,18 +435,22 @@ def parse_config_entries(text: str) -> List[Tuple[str, Dict[str, str], str]]:
     current_opts: Dict[str, str] = {}
     current_folder = FOLDER_UNCATEGORIZED
     current_legacy = False
+    current_twofa = False
     in_match = False
 
     def flush_hosts() -> None:
-        nonlocal current_hosts, current_opts, current_legacy
+        nonlocal current_hosts, current_opts, current_legacy, current_twofa
         for h in current_hosts:
             opts = dict(current_opts)
             if current_legacy:
                 opts["_vnssh_legacy"] = "1"
+            if current_twofa:
+                opts["_vnssh_2fa"] = "1"
             entries.append((h, opts, current_folder))
         current_hosts = []
         current_opts = {}
         current_legacy = False
+        current_twofa = False
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -437,6 +465,8 @@ def parse_config_entries(text: str) -> List[Tuple[str, Dict[str, str], str]]:
                 continue
             if parse_legacy_comment(line):
                 current_legacy = True
+            if parse_twofa_comment(line):
+                current_twofa = True
             continue
         lower = line.lower()
         if lower.startswith("match "):
@@ -500,8 +530,28 @@ def is_listable_host(name: str) -> bool:
     return True
 
 
+_RAW_HOSTS_CACHE: Optional[Tuple[float, float, Dict[str, Tuple[Dict[str, str], Path, str]]]] = (
+    None
+)
+
+
+def _config_cache_times() -> Tuple[float, float]:
+    hosts_mtime = HOSTS_CONF.stat().st_mtime if HOSTS_CONF.exists() else 0.0
+    ssh_mtime = SSH_CONFIG.stat().st_mtime if SSH_CONFIG.exists() else 0.0
+    return hosts_mtime, ssh_mtime
+
+
 def gather_raw_hosts() -> Dict[str, Tuple[Dict[str, str], Path, str]]:
     """Map host alias -> (options, source file, folder)."""
+    global _RAW_HOSTS_CACHE
+    hosts_mtime, ssh_mtime = _config_cache_times()
+    if (
+        _RAW_HOSTS_CACHE is not None
+        and _RAW_HOSTS_CACHE[0] == hosts_mtime
+        and _RAW_HOSTS_CACHE[1] == ssh_mtime
+    ):
+        return _RAW_HOSTS_CACHE[2]
+
     seen: Dict[str, Tuple[Dict[str, str], Path, str]] = {}
     visited: set[Path] = set()
 
@@ -521,6 +571,7 @@ def gather_raw_hosts() -> Dict[str, Tuple[Dict[str, str], Path, str]]:
         walk(SSH_CONFIG)
     if HOSTS_CONF.exists():
         walk(HOSTS_CONF)
+    _RAW_HOSTS_CACHE = (hosts_mtime, ssh_mtime, seen)
     return seen
 
 
@@ -568,6 +619,96 @@ def infer_auth(opts: Dict[str, str], has_password: bool) -> str:
     if identity:
         return AUTH_KEY
     return AUTH_PASSWORD
+
+
+_SSH_G_CACHE: Dict[str, Dict[str, str]] = {}
+_SSH_G_IDENTITY_CACHE: Dict[str, List[str]] = {}
+
+_DEFAULT_SSH_IDENTITY_NAMES = frozenset(
+    {
+        "id_rsa",
+        "id_ecdsa",
+        "id_ecdsa_sk",
+        "id_ed25519",
+        "id_ed25519_sk",
+        "id_xmss",
+        "id_dsa",
+    }
+)
+
+
+def resolve_with_ssh_g_cached(host: str) -> Dict[str, str]:
+    if host not in _SSH_G_CACHE:
+        _SSH_G_CACHE[host] = resolve_with_ssh_g(host)
+    return _SSH_G_CACHE[host]
+
+
+def ssh_g_identity_files(host: str) -> List[str]:
+    if host not in _SSH_G_IDENTITY_CACHE:
+        proc = subprocess.run(
+            ["ssh", "-G", host],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        paths: List[str] = []
+        if proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                if line.startswith("identityfile "):
+                    paths.append(line.split(" ", 1)[1].strip())
+        _SSH_G_IDENTITY_CACHE[host] = paths
+    return _SSH_G_IDENTITY_CACHE[host]
+
+
+def is_default_ssh_identity(path: str) -> bool:
+    expanded = os.path.expanduser(path)
+    return (
+        os.path.basename(expanded) in _DEFAULT_SSH_IDENTITY_NAMES
+        and os.path.dirname(expanded) == os.path.expanduser("~/.ssh")
+    )
+
+
+def configured_identity_file(host: str, opts: Dict[str, str]) -> str:
+    """Return a user-configured IdentityFile, ignoring OpenSSH default key paths."""
+    explicit = opts.get("identityfile", "")
+    if explicit:
+        return explicit
+    for path in ssh_g_identity_files(host):
+        if path and not is_default_ssh_identity(path):
+            return path
+    return ""
+
+
+def connection_auth_mode(host: str) -> str:
+    """Resolve auth mode for connect-time SSH args (may run ssh -G when needed)."""
+    entry = gather_raw_hosts().get(host)
+    opts = entry[0] if entry else {}
+    explicit = opts.get("identityfile", "")
+    has_pw = keychain_has(host)
+    if explicit:
+        return infer_auth({"identityfile": explicit}, has_pw)
+    if not has_pw:
+        return infer_auth({"identityfile": ""}, False)
+    for path in ssh_g_identity_files(host):
+        if path and not is_default_ssh_identity(path):
+            return AUTH_BOTH
+    return AUTH_PASSWORD
+
+
+def host_wants_auto_password(host: str) -> bool:
+    """True when #v-2fa hosts should auto-fill via PTY prompt detection."""
+    return keychain_has(host) and host_2fa_enabled(host)
+
+
+def password_delivery_mode(
+    host: str, *, interactive: bool
+) -> Tuple[bool, bool]:
+    """Return (use_askpass, use_pty_password_inject) for Keychain-backed hosts."""
+    if not keychain_has(host):
+        return False, False
+    if interactive and host_2fa_enabled(host):
+        return False, True
+    return True, False
 
 
 def load_connections() -> List[Connection]:
@@ -687,6 +828,8 @@ def merged_opts_from_wizard(
     if prior:
         if prior.get("_vnssh_legacy") == "1":
             opts["_vnssh_legacy"] = "1"
+        if prior.get("_vnssh_2fa") == "1" or prior.get("_vnssh_bastion") == "1":
+            opts["_vnssh_2fa"] = "1"
         for key, value in prior.items():
             if key.startswith("_") or not value or key in opts:
                 continue
@@ -697,10 +840,13 @@ def merged_opts_from_wizard(
 def format_parsed_host_block(host: str, opts: Dict[str, str], folder: str) -> str:
     block = format_host_block(host_entry_to_wizard(host, opts, folder))
     lines = block.splitlines()
-    if opts.get("_vnssh_legacy") == "1" and lines and lines[0].startswith(
-        FOLDER_COMMENT_PREFIX
-    ):
-        lines.insert(1, LEGACY_COMMENT_PREFIX)
+    if lines and lines[0].startswith(FOLDER_COMMENT_PREFIX):
+        insert_at = 1
+        if opts.get("_vnssh_2fa") == "1":
+            lines.insert(insert_at, TWOFA_COMMENT_PREFIX)
+            insert_at += 1
+        if opts.get("_vnssh_legacy") == "1":
+            lines.insert(insert_at, LEGACY_COMMENT_PREFIX)
 
     extra_lines: List[str] = []
     for key, value in opts.items():
@@ -993,15 +1139,6 @@ def askpass_main() -> None:
     sys.exit(0)
 
 
-def connection_auth_mode(host: str) -> str:
-    raw = gather_raw_hosts()
-    entry = raw.get(host)
-    opts = entry[0] if entry else {}
-    has_identity = bool(opts.get("identityfile"))
-    has_pw = keychain_has(host)
-    return infer_auth({"identityfile": opts.get("identityfile", "")}, has_pw)
-
-
 def is_valid_ssh_host_argument(name: str) -> bool:
     """OpenSSH rejects non-ASCII and some punctuation in the hostname argument."""
     if not name:
@@ -1022,6 +1159,15 @@ def host_legacy_enabled(host: str) -> bool:
     if not entry:
         return False
     return entry[0].get("_vnssh_legacy") == "1"
+
+
+def host_2fa_enabled(host: str) -> bool:
+    raw = gather_raw_hosts()
+    entry = raw.get(host)
+    if not entry:
+        return False
+    opts = entry[0]
+    return opts.get("_vnssh_2fa") == "1" or opts.get("_vnssh_bastion") == "1"
 
 
 def legacy_ssh_option_args() -> List[str]:
@@ -1231,7 +1377,7 @@ def password_expired_error(err: str, host: str) -> Optional[str]:
     lower = err.lower()
     if "password expired" in lower or "password has expired" in lower:
         return f"{host}: password expired (reset on bastion portal or contact admin)"
-    if "密码过期" in err or "密码已过期" in err:
+    if "\u5bc6\u7801\u8fc7\u671f" in err or "\u5bc6\u7801\u5df2\u8fc7\u671f" in err:
         return f"{host}: password expired (reset on bastion portal or contact admin)"
     reason = ssh_disconnect_reason(err)
     if reason and "passwordexpired" in reason.lower().replace(" ", ""):
@@ -1436,6 +1582,24 @@ def open_controlling_tty() -> Optional[int]:
         return None
 
 
+def set_terminal_title(title: str) -> None:
+    """Set Ghostty/xterm window title via OSC sequences."""
+    if not title:
+        return
+    safe = title.replace("\x1b", "").replace("\x07", "")
+    try:
+        fd = os.open("/dev/tty", os.O_WRONLY)
+    except OSError:
+        return
+    try:
+        payload = f"\033]0;{safe}\007\033]2;{safe}\007".encode("utf-8")
+        os.write(fd, payload)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def clear_terminal_screen() -> None:
     """Erase physical terminal content left by SSH (incl. alternate screen)."""
     try:
@@ -1487,11 +1651,13 @@ def restore_tty_attrs(fd: int, attrs: Optional[List]) -> None:
 
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
-_PASSWORD_PROMPT_MARKERS = (
+_TWOFA_PASSWORD_PROMPT_MARKERS = (
     re.compile(r"(?i)please input password"),
     re.compile(r"(?i)password of operation account"),
     re.compile(r"(?i)\[LOGIN\].*password"),
 )
+
+_OPENSSH_PASSWORD_PROMPT = re.compile(r"(?i)(?:'s|\u2019s) password:\s*$")
 
 _VERIFICATION_PROMPT_MARKERS = (
     re.compile(r"(?i)verification\s*code"),
@@ -1499,8 +1665,32 @@ _VERIFICATION_PROMPT_MARKERS = (
     re.compile(r"(?i)one[- ]time"),
     re.compile(r"(?i)2fa"),
     re.compile(r"(?i)mfa"),
-    re.compile(r"验证码"),
-    re.compile(r"二次验证"),
+    re.compile(r"(?i)dynamic\s+password"),
+    re.compile(r"(?i)auth(?:entication)?\s*code"),
+    re.compile(r"(?i)\btoken\b"),
+    re.compile(r"\u9a8c\u8bc1\u7801"),
+    re.compile(r"\u4e8c\u6b21\u9a8c\u8bc1"),
+    re.compile(r"\u52a8\u6001\u53e3\u4ee4"),
+)
+
+_AUTH_FAILURE_MARKERS = (
+    re.compile(r"(?i)password\s*expired"),
+    re.compile(r"(?i)passwordexpired"),
+    re.compile(r"(?i)received disconnect"),
+    re.compile(r"(?i)authentication failed"),
+    re.compile(r"\u5bc6\u7801\u8fc7\u671f"),
+)
+
+_AUTO_PASSWORD_DELAY = 0.45
+_SESSION_LOG_READY_DELAY = 0.4
+_RECENT_OUTPUT_WINDOW = 16384
+_LOG_FLUSH_BYTES = 4096
+_LOG_FLUSH_INTERVAL = 0.05
+
+_SSH_CLIENT_MARKERS = (
+    re.compile(r"(?i)the authenticity of host"),
+    re.compile(r"(?i)are you sure you want to continue connecting"),
+    re.compile(r"(?i)warning: permanently added"),
 )
 
 
@@ -1508,21 +1698,90 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_ESCAPE.sub("", text)
 
 
-def should_auto_send_password(recent_text: str) -> bool:
-    """True when the latest PTY output is the saved-password prompt (not 2FA)."""
+def _recent_output_lines(recent_text: str, *, tail: int = 8) -> List[str]:
     clean = _strip_ansi(recent_text)
     lines = [line.strip() for line in clean.splitlines() if line.strip()]
-    if not lines:
-        return False
-    for line in reversed(lines[-6:]):
+    return lines[-tail:]
+
+
+def _has_auth_failure(recent_text: str) -> bool:
+    clean = _strip_ansi(recent_text)
+    return any(marker.search(clean) for marker in _AUTH_FAILURE_MARKERS)
+
+
+def _prompt_line_complete(line: str) -> bool:
+    if line.endswith(":") or line.endswith("：") or line.endswith("..."):
+        return True
+    return any(marker.search(line) for marker in _TWOFA_PASSWORD_PROMPT_MARKERS)
+
+
+def _password_prompt_signature(
+    recent_text: str, *, allow_standard_password: bool = False
+) -> Optional[str]:
+    if _has_auth_failure(recent_text):
+        return None
+    tail = _strip_ansi(recent_text)[-2000:]
+    if any(marker.search(tail) for marker in _VERIFICATION_PROMPT_MARKERS):
+        return None
+    for line in reversed(_recent_output_lines(recent_text)):
         if any(marker.search(line) for marker in _VERIFICATION_PROMPT_MARKERS):
-            return False
-        if any(marker.search(line) for marker in _PASSWORD_PROMPT_MARKERS):
-            return True
-        lower = line.lower()
-        if "[login]" in lower and "password" in lower:
+            return None
+        if any(marker.search(line) for marker in _TWOFA_PASSWORD_PROMPT_MARKERS):
+            return line if _prompt_line_complete(line) else None
+        if allow_standard_password and _OPENSSH_PASSWORD_PROMPT.search(line):
+            return line
+    return None
+
+
+def _has_active_verification_prompt(recent_text: str) -> bool:
+    """True while recent output still contains an OTP/2FA prompt."""
+    for line in _recent_output_lines(recent_text, tail=4):
+        if any(marker.search(line) for marker in _VERIFICATION_PROMPT_MARKERS):
             return True
     return False
+
+
+def _bastion_ui_visible(recent_text: str) -> bool:
+    clean = _strip_ansi(recent_text)
+    return bool(_BASTION_UI_MARKER.search(clean))
+
+
+def _parse_nested_login_success(recent_bytes: bytes) -> Optional[Tuple[str, int, str]]:
+    """Match nested login success in recent PTY output (handles TCP chunk splits)."""
+    if not recent_bytes:
+        return None
+    match = _NESTED_LOGIN_OK.search(recent_bytes[-4096:])
+    if not match:
+        return None
+    return match.group(1).decode("utf-8", errors="replace"), int(match.group(2)), (
+        match.group(3).decode("utf-8", errors="replace")
+    )
+
+
+def _session_ready_for_log(
+    recent_text: str,
+    *,
+    auto_password: bool,
+    password_sent: bool,
+    twofa_enabled: bool = False,
+) -> bool:
+    tail = _strip_ansi(recent_text)[-2000:]
+    if any(marker.search(tail) for marker in _AUTH_FAILURE_MARKERS):
+        return False
+    if _password_prompt_signature(recent_text, allow_standard_password=True):
+        return False
+    if _has_active_verification_prompt(recent_text):
+        return False
+    if (auto_password or twofa_enabled) and not password_sent:
+        return False
+    if len(tail.strip()) < 8:
+        return False
+    recent_lines = _recent_output_lines(recent_text, tail=6)
+    if recent_lines and all(
+        any(marker.search(line) for marker in _SSH_CLIENT_MARKERS) for line in recent_lines
+    ):
+        return False
+    return True
 
 
 def clear_askpass_env(env: Dict[str, str]) -> None:
@@ -1531,18 +1790,195 @@ def clear_askpass_env(env: Dict[str, str]) -> None:
         "SSH_ASKPASS_REQUIRE",
         "VNSSH_HOST",
         "VNSSH_ASKPASS_SESSION",
+        "VNSSH_AUTO_PASSWORD_HOST",
+        "VNSSH_AUTH_MODE",
     ):
         env.pop(var, None)
 
 
-def run_ssh_with_tty(argv: List[str], env: Dict[str, str]) -> Tuple[int, str]:
+def session_logging_enabled() -> bool:
+    token = os.environ.get("VNSSH_SESSION_LOG", "1").strip().lower()
+    return token not in ("0", "false", "no", "off")
+
+
+def sanitize_log_component(text: str, *, max_len: int = 56) -> str:
+    cleaned = re.sub(r"[^\w\-.@+]+", "_", text.strip())
+    cleaned = cleaned.strip("._") or "host"
+    return cleaned[:max_len]
+
+
+def session_endpoint_fields(host: str) -> Dict[str, object]:
+    entry = gather_raw_hosts().get(host)
+    opts = entry[0] if entry else {}
+    hostname, user, port = resolve_connection_fields(host, opts)
+    endpoint = f"{user}@{hostname}" if user else hostname
+    return {
+        "host": host,
+        "hostname": hostname,
+        "user": user,
+        "port": port,
+        "endpoint": endpoint,
+    }
+
+
+def allocate_session_log_path(host: str, started: datetime) -> Path:
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    fields = session_endpoint_fields(host)
+    endpoint = str(fields["endpoint"])
+    port = int(fields["port"])
+    stamp = started.strftime("%Y-%m-%d_%H%M%S")
+    base = (
+        f"{stamp}_{sanitize_log_component(host)}_"
+        f"{sanitize_log_component(endpoint)}"
+    )
+    if port != DEFAULT_PORT:
+        base += f"_p{port}"
+    suffix = 0
+    while True:
+        name = base if suffix == 0 else f"{base}_{suffix}"
+        transcript = SESSIONS_DIR / f"{name}.session"
+        if not transcript.exists():
+            return transcript
+        suffix += 1
+
+
+def allocate_nested_session_log_path(
+    bastion_host: str,
+    *,
+    target_host: str,
+    target_user: str,
+    target_port: int,
+    started: datetime,
+) -> Path:
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = started.strftime("%Y-%m-%d_%H%M%S")
+    base = (
+        f"{stamp}_{sanitize_log_component(target_host)}_"
+        f"{sanitize_log_component(target_user)}"
+        f"_via_{sanitize_log_component(bastion_host)}"
+    )
+    if target_port != DEFAULT_PORT:
+        base += f"_p{target_port}"
+    suffix = 0
+    while True:
+        name = base if suffix == 0 else f"{base}_{suffix}"
+        transcript = SESSIONS_DIR / f"{name}.session"
+        if not transcript.exists():
+            return transcript
+        suffix += 1
+
+
+_SESSION_LOG_CSI = re.compile(rb"(?:\x1b|\x9b)[\[\(][0-9;?]*[ -/]*[@-~]")
+_SESSION_LOG_OSC = re.compile(rb"\x1b\][^\x07]*(?:\x07|\x1b\\)")
+_SESSION_LOG_MORE = re.compile(rb"-{2,}\s*More\s*-{2,}\s*", re.IGNORECASE)
+_SESSION_LOG_MORE_ALT = re.compile(rb"--\s*More\s*--\s*", re.IGNORECASE)
+_SESSION_LOG_ORPHAN_SGR = re.compile(rb"(?:;\d+)+m|\d+m")
+_BASTION_UI_MARKER = re.compile(r"TencentCloud BastionHost|BastionHost", re.I)
+_NESTED_LOGIN_OK = re.compile(
+    rb"login to (\S+?):(\d+) with account (\S+) success", re.IGNORECASE
+)
+_NESTED_LOGOUT = re.compile(rb"logout from \S+@\S+:\d+", re.IGNORECASE)
+
+
+def _sanitize_session_log_chunk(data: bytes) -> bytes:
+    if not data:
+        return b""
+    cleaned = _SESSION_LOG_CSI.sub(b"", data)
+    cleaned = _SESSION_LOG_OSC.sub(b"", cleaned)
+    cleaned = _SESSION_LOG_MORE.sub(b"", cleaned)
+    cleaned = _SESSION_LOG_MORE_ALT.sub(b"", cleaned)
+    return cleaned
+
+
+def _normalize_session_log_chunk(data: bytes) -> bytes:
+    if not data:
+        return b""
+    cleaned = _sanitize_session_log_chunk(data)
+    cleaned = _SESSION_LOG_ORPHAN_SGR.sub(b"", cleaned)
+    cleaned = cleaned.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return cleaned
+
+
+class SessionLogSanitizer:
+    """Strip pager prompts and terminal control sequences from session logs."""
+
+    _HOLD_BACK = 16
+
+    def __init__(self) -> None:
+        self._pending = bytearray()
+
+    def feed(self, data: bytes) -> bytes:
+        if not data:
+            return b""
+        self._pending.extend(data)
+        if len(self._pending) <= self._HOLD_BACK:
+            return b""
+        emit_len = len(self._pending) - self._HOLD_BACK
+        emit = bytes(self._pending[:emit_len])
+        del self._pending[:emit_len]
+        return _normalize_session_log_chunk(emit)
+
+    def flush(self) -> bytes:
+        if not self._pending:
+            return b""
+        cleaned = _normalize_session_log_chunk(bytes(self._pending))
+        self._pending.clear()
+        return cleaned
+
+
+def sanitize_session_log_file(transcript_path: Path) -> None:
+    try:
+        raw = transcript_path.read_bytes()
+    except OSError:
+        return
+    if not raw:
+        return
+    sanitizer = SessionLogSanitizer()
+    cleaned = bytearray()
+    for offset in range(0, len(raw), 65536):
+        cleaned.extend(sanitizer.feed(raw[offset : offset + 65536]))
+    cleaned.extend(sanitizer.flush())
+    payload = bytes(cleaned)
+    if payload == raw:
+        return
+    try:
+        transcript_path.write_bytes(payload)
+    except OSError:
+        pass
+
+
+def begin_session_log(host: str) -> Optional[Path]:
+    if not session_logging_enabled():
+        return None
+    return allocate_session_log_path(host, datetime.now().astimezone())
+
+
+def run_ssh_with_tty(
+    argv: List[str],
+    env: Dict[str, str],
+    *,
+    transcript_path: Optional[Path] = None,
+    session_host: str = "",
+) -> Tuple[int, str]:
     """Run ssh on a pty; relay via /dev/tty so prompts work after curses."""
+    askpass_session = env.get("VNSSH_ASKPASS_SESSION", "")
+    _, askpass_lock = (
+        askpass_session_paths(askpass_session)
+        if askpass_session
+        else (None, None)
+    )
+
     auto_password_host = env.get("VNSSH_AUTO_PASSWORD_HOST", "")
+    auto_password_auth_mode = env.get("VNSSH_AUTH_MODE", AUTH_PASSWORD)
+    twofa_enabled = bool(
+        auto_password_host and host_2fa_enabled(auto_password_host)
+    )
     auto_password: Optional[str] = None
     if auto_password_host and keychain_has(auto_password_host):
         auto_password = keychain_get(auto_password_host)
     password_sent = False
-
+    password_pending_since: Optional[float] = None
+    password_prompt_sig: Optional[str] = None
     tty_fd = open_controlling_tty()
     if tty_fd is None and not sys.stdin.isatty():
         proc = subprocess.run(argv, env=env, capture_output=True, text=True)
@@ -1571,15 +2007,194 @@ def run_ssh_with_tty(argv: List[str], env: Dict[str, str]) -> Tuple[int, str]:
         nonlocal resize_pending
         resize_pending = True
 
+    def tick_auto_password() -> None:
+        nonlocal password_sent, password_pending_since, password_prompt_sig
+        if not auto_password or password_sent or not recent_output:
+            return
+        sig = _password_prompt_signature(
+            recent_output,
+            allow_standard_password=auto_password_auth_mode
+            in (AUTH_PASSWORD, AUTH_BOTH),
+        )
+        if not sig:
+            password_pending_since = None
+            password_prompt_sig = None
+            return
+        now = time.monotonic()
+        if password_prompt_sig != sig:
+            password_prompt_sig = sig
+            password_pending_since = now
+            return
+        if (
+            password_pending_since is not None
+            and now - password_pending_since >= _AUTO_PASSWORD_DELAY
+        ):
+            password_sent = True
+            payload = (auto_password + "\n").encode("utf-8")
+            os.write(master_fd, payload)
+            output.extend(payload)
+            password_pending_since = None
+
+    log_file: Optional[object] = None
+    logging_active = False
+    log_ready_since: Optional[float] = None
+    initial_auth_done = False
+    bastion_ui_seen = False
+    log_write_buffer = bytearray()
+    last_log_flush = 0.0
+    log_enabled = session_logging_enabled() and bool(session_host)
+    log_sanitizer: Optional[SessionLogSanitizer] = None
+    active_transcript_path = transcript_path
+
+    def flush_session_log_buffer(*, force: bool = False) -> None:
+        nonlocal last_log_flush
+        if log_file is None or not log_write_buffer:
+            return
+        now = time.monotonic()
+        if (
+            not force
+            and len(log_write_buffer) < _LOG_FLUSH_BYTES
+            and now - last_log_flush < _LOG_FLUSH_INTERVAL
+        ):
+            return
+        log_file.write(log_write_buffer)
+        log_write_buffer.clear()
+        last_log_flush = now
+
+    def finalize_session_log_file(*, sanitize: bool = True) -> None:
+        nonlocal log_file, logging_active, log_sanitizer
+        if log_file is None:
+            return
+        if log_sanitizer is not None:
+            try:
+                pending = log_sanitizer.flush()
+                if pending:
+                    log_write_buffer.extend(pending)
+            except OSError:
+                pass
+        try:
+            flush_session_log_buffer(force=True)
+            log_file.close()
+        except OSError:
+            pass
+        if sanitize and active_transcript_path is not None:
+            sanitize_session_log_file(active_transcript_path)
+        log_file = None
+        logging_active = False
+        log_sanitizer = None
+
+    def open_session_log(path: Path) -> bool:
+        nonlocal log_file, logging_active, log_sanitizer, active_transcript_path
+        nonlocal last_log_flush
+        finalize_session_log_file(sanitize=True)
+        try:
+            log_file = path.open("ab", buffering=1024 * 1024)
+        except OSError:
+            return False
+        active_transcript_path = path
+        log_sanitizer = SessionLogSanitizer()
+        logging_active = True
+        last_log_flush = time.monotonic()
+        return True
+
+    def write_session_log(data: bytes) -> None:
+        if not logging_active or log_file is None:
+            return
+        cleaned = (
+            log_sanitizer.feed(data)
+            if log_sanitizer is not None
+            else _normalize_session_log_chunk(data)
+        )
+        if cleaned:
+            log_write_buffer.extend(cleaned)
+            flush_session_log_buffer()
+
+    def try_start_nested_session_log(data: bytes) -> bool:
+        if not log_enabled or not session_host or not bastion_ui_seen:
+            return False
+        parsed = _parse_nested_login_success(bytes(output))
+        if parsed is None:
+            return False
+        target_host, target_port, target_user = parsed
+        nested_path = allocate_nested_session_log_path(
+            session_host,
+            target_host=target_host,
+            target_user=target_user,
+            target_port=target_port,
+            started=datetime.now().astimezone(),
+        )
+        return open_session_log(nested_path)
+
+    def try_start_direct_session_log() -> bool:
+        nonlocal log_ready_since, initial_auth_done, active_transcript_path
+        if not log_enabled or logging_active or bastion_ui_seen:
+            return False
+        if askpass_lock is not None and askpass_lock.exists():
+            log_ready_since = None
+            return False
+        if not initial_auth_done:
+            if not _session_ready_for_log(
+                recent_output,
+                auto_password=bool(auto_password),
+                password_sent=password_sent,
+                twofa_enabled=twofa_enabled,
+            ):
+                log_ready_since = None
+                return False
+            initial_auth_done = True
+        now = time.monotonic()
+        if log_ready_since is None:
+            log_ready_since = now
+            return False
+        if now - log_ready_since < _SESSION_LOG_READY_DELAY:
+            return False
+        if active_transcript_path is None:
+            active_transcript_path = begin_session_log(session_host)
+            if active_transcript_path is None:
+                return False
+        return open_session_log(active_transcript_path)
+
+    def update_session_log(data: bytes) -> None:
+        nonlocal bastion_ui_seen
+        if not log_enabled:
+            return
+        if _bastion_ui_visible(recent_output):
+            bastion_ui_seen = True
+        if logging_active:
+            if bastion_ui_seen and _NESTED_LOGOUT.search(bytes(output[-2048:])):
+                write_session_log(data)
+                flush_session_log_buffer(force=True)
+                if log_sanitizer is not None:
+                    pending = log_sanitizer.flush()
+                    if pending:
+                        log_write_buffer.extend(pending)
+                flush_session_log_buffer(force=True)
+                finalize_session_log_file()
+                return
+            write_session_log(data)
+            return
+        if try_start_nested_session_log(data):
+            write_session_log(data)
+            flush_session_log_buffer(force=True)
+            return
+        if try_start_direct_session_log():
+            write_session_log(data)
+
     try:
         saved_tty = termios.tcgetattr(terminal_fd)
         tty.setraw(terminal_fd, termios.TCSADRAIN)
         old_winch = signal.signal(signal.SIGWINCH, on_winch)
+        recent_output = ""
         while True:
             if resize_pending:
                 resize_pending = False
                 sync_pty_window_size(master_fd, terminal_fd)
-            readable, _, _ = select.select([master_fd, terminal_fd], [], [], 0.2)
+            relay_fds = [master_fd]
+            if askpass_lock is None or not askpass_lock.exists():
+                relay_fds.append(terminal_fd)
+            readable, _, _ = select.select(relay_fds, [], [], 0.2)
+            if logging_active:
+                flush_session_log_buffer()
             if master_fd in readable:
                 try:
                     data = os.read(master_fd, 8192)
@@ -1589,13 +2204,11 @@ def run_ssh_with_tty(argv: List[str], env: Dict[str, str]) -> Tuple[int, str]:
                     break
                 output.extend(data)
                 os.write(terminal_fd, data)
-                if auto_password and not password_sent:
-                    recent = output.decode("utf-8", errors="replace")
-                    if should_auto_send_password(recent):
-                        password_sent = True
-                        payload = (auto_password + "\n").encode("utf-8")
-                        os.write(master_fd, payload)
-                        output.extend(payload)
+                if len(output) > _RECENT_OUTPUT_WINDOW:
+                    del output[: len(output) - _RECENT_OUTPUT_WINDOW]
+                recent_output = output.decode("utf-8", errors="replace")
+                update_session_log(data)
+            tick_auto_password()
             if terminal_fd in readable:
                 try:
                     data = os.read(terminal_fd, 8192)
@@ -1607,6 +2220,7 @@ def run_ssh_with_tty(argv: List[str], env: Dict[str, str]) -> Tuple[int, str]:
     finally:
         signal.signal(signal.SIGWINCH, old_winch)
         restore_tty_attrs(terminal_fd, saved_tty)
+        finalize_session_log_file()
         if tty_fd is not None:
             os.close(tty_fd)
         os.close(master_fd)
@@ -1622,37 +2236,69 @@ def run_ssh_with_tty(argv: List[str], env: Dict[str, str]) -> Tuple[int, str]:
 
 def prepare_ssh_invocation(
     host: str, *, legacy: bool, use_keychain: bool, interactive: bool = True
-) -> Tuple[List[str], Dict[str, str], bool]:
+) -> Tuple[List[str], Dict[str, str], bool, bool]:
     ssh_args = build_ssh_argv(host, legacy=legacy)
     env = os.environ.copy()
-    use_keychain_password = use_keychain and keychain_has(host)
-    if use_keychain_password and not interactive:
+    use_askpass, use_pty_inject = (
+        password_delivery_mode(host, interactive=interactive)
+        if use_keychain
+        else (False, False)
+    )
+    if use_askpass:
         env = askpass_env(host, env)
     else:
         clear_askpass_env(env)
         if interactive and "-tt" not in ssh_args:
             ssh_args.insert(1, "-tt")
-    return ssh_args, env, use_keychain_password
+    return ssh_args, env, use_askpass, use_pty_inject
 
 
 def run_ssh_session(
     ssh_args: List[str],
     env: Dict[str, str],
-    use_keychain_password: bool,
+    use_askpass: bool,
     exec_mode: bool,
     *,
     host: str = "",
+    use_pty_password_inject: bool = False,
 ) -> ConnectResult:
-    if exec_mode:
-        os.execvpe("ssh", ssh_args, env)
     args = list(ssh_args)
     run_env = dict(env)
-    clear_askpass_env(run_env)
-    if use_keychain_password and host:
+    session = ""
+    if use_askpass:
+        session = secrets.token_hex(8)
+        run_env["VNSSH_ASKPASS_SESSION"] = session
+        cleanup_askpass_session(session)
+    elif use_pty_password_inject and host:
         run_env["VNSSH_AUTO_PASSWORD_HOST"] = host
-    if "-tt" not in args:
+        run_env["VNSSH_AUTH_MODE"] = connection_auth_mode(host)
+    else:
+        clear_askpass_env(run_env)
+    if use_askpass or use_pty_password_inject:
+        if "-tt" not in args:
+            args.insert(1, "-tt")
+    elif "-tt" not in args:
         args.insert(1, "-tt")
-    returncode, stderr = run_ssh_with_tty(args, run_env)
+
+    defer_session_log = bool(host and host_2fa_enabled(host))
+    transcript_path = (
+        None if defer_session_log else (begin_session_log(host) if host else None)
+    )
+
+    if exec_mode:
+        os.execvpe(args[0], args, run_env)
+
+    returncode = 1
+    stderr = ""
+    try:
+        returncode, stderr = run_ssh_with_tty(
+            args,
+            run_env,
+            transcript_path=transcript_path,
+            session_host=host,
+        )
+    finally:
+        cleanup_askpass_session(session)
     return ConnectResult(returncode, stderr=stderr)
 
 
@@ -1667,26 +2313,41 @@ def connect_host(
         if not legacy and probe_algorithm_mismatch(host):
             persist_legacy_host(host)
             legacy = True
-        ssh_args, env, use_keychain_password = prepare_ssh_invocation(
+        ssh_args, env, use_askpass, use_pty_inject = prepare_ssh_invocation(
             host, legacy=legacy, use_keychain=use_keychain, interactive=False
         )
         run_ssh_session(
-            ssh_args, env, use_keychain_password, exec_mode=True, host=host
+            ssh_args,
+            env,
+            use_askpass,
+            exec_mode=True,
+            host=host,
+            use_pty_password_inject=use_pty_inject,
         )
 
-    ssh_args, env, use_keychain_password = prepare_ssh_invocation(
+    ssh_args, env, use_askpass, use_pty_inject = prepare_ssh_invocation(
         host, legacy=legacy, use_keychain=use_keychain, interactive=True
     )
     result = run_ssh_session(
-        ssh_args, env, use_keychain_password, exec_mode=False, host=host
+        ssh_args,
+        env,
+        use_askpass,
+        exec_mode=False,
+        host=host,
+        use_pty_password_inject=use_pty_inject,
     )
     if not legacy and ssh_algorithm_mismatch(result):
         persist_legacy_host(host)
-        ssh_args, env, use_keychain_password = prepare_ssh_invocation(
+        ssh_args, env, use_askpass, use_pty_inject = prepare_ssh_invocation(
             host, legacy=True, use_keychain=use_keychain, interactive=True
         )
         result = run_ssh_session(
-            ssh_args, env, use_keychain_password, exec_mode=False, host=host
+            ssh_args,
+            env,
+            use_askpass,
+            exec_mode=False,
+            host=host,
+            use_pty_password_inject=use_pty_inject,
         )
     return result
 
@@ -2340,6 +3001,7 @@ class MainUI:
 
     def resume_after_ssh(self) -> None:
         clear_terminal_screen()
+        set_terminal_title(VNSSH_TERMINAL_TITLE)
         curses.reset_prog_mode()
         curses.cbreak()
         self.stdscr.keypad(True)
@@ -2712,6 +3374,7 @@ class MainUI:
 
 
 def main_curses(stdscr) -> None:
+    set_terminal_title(VNSSH_TERMINAL_TITLE)
     curses.set_escdelay(25)
     init_colors()
     stdscr.keypad(True)
@@ -2767,11 +3430,11 @@ def canonicalize_import_row(raw: Dict[str, str]) -> Dict[str, str]:
 
 def parse_import_auth(value: str, identity_file: str, password: str) -> str:
     token = value.strip().lower()
-    if token in ("", "password", "pass", "1", "密码"):
+    if token in ("", "password", "pass", "1"):
         return AUTH_PASSWORD
-    if token in ("key", "2", "密钥"):
+    if token in ("key", "2"):
         return AUTH_KEY
-    if token in ("both", "3", "两者"):
+    if token in ("both", "3"):
         return AUTH_BOTH
     if identity_file and password:
         return AUTH_BOTH
