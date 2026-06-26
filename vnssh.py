@@ -52,7 +52,9 @@ PROBE_CONNECT_TIMEOUT = 2
 LEGACY_SSH_OPTIONS = (
     (
         "KexAlgorithms",
-        "+diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha1,"
+        # Prefer fast fixed-group KEX first; "+" would append after OpenSSH
+        # defaults and still negotiate slow diffie-hellman-group-exchange-sha256.
+        "diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha1,"
         "diffie-hellman-group1-sha1",
     ),
     ("HostKeyAlgorithms", "+ssh-rsa"),
