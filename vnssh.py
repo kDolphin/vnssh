@@ -49,6 +49,8 @@ SSH_CONNECT_OPTIONS = (
     ("ConnectTimeout", "5"),
 )
 PROBE_CONNECT_TIMEOUT = 2
+AUTO_LEGACY_FAST_PROBE_MAX = 5.0
+AUTO_LEGACY_SLOW_DEFAULT_MIN = 5.0
 LEGACY_SSH_OPTIONS = (
     (
         "KexAlgorithms",
@@ -1208,6 +1210,81 @@ def ssh_algorithm_mismatch(result: ConnectResult) -> bool:
         "no matching host key type found",
     )
     return any(phrase in err for phrase in phrases)
+
+
+def _probe_network_failure(stderr: str) -> bool:
+    err = stderr.lower()
+    return any(
+        phrase in err
+        for phrase in (
+            "connection timed out",
+            "could not resolve",
+            "no route to host",
+            "network is unreachable",
+            "operation timed out",
+        )
+    )
+
+
+def _probe_reached_userauth(result: ConnectResult) -> bool:
+    if ssh_algorithm_mismatch(result) or _probe_network_failure(result.stderr or ""):
+        return False
+    err = (result.stderr or "").lower()
+    markers = (
+        "permission denied",
+        "keyboard-interactive",
+        "user authentication",
+        "authentication failed",
+    )
+    return any(marker in err for marker in markers)
+
+
+def _probe_batch_ssh(
+    host: str,
+    ssh_options: Tuple[Tuple[str, str], ...] = (),
+) -> Tuple[float, ConnectResult]:
+    target, extra = resolve_ssh_endpoint(host)
+    args = [
+        "ssh",
+        "-F",
+        "none",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        f"ConnectTimeout={PROBE_CONNECT_TIMEOUT}",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+    ]
+    for key, value in ssh_options:
+        args.extend(["-o", f"{key}={value}"])
+    args.extend(extra)
+    args.append(target)
+    start = time.monotonic()
+    proc = subprocess.run(args, capture_output=True, text=True)
+    elapsed = time.monotonic() - start
+    return elapsed, ConnectResult(proc.returncode, proc.stderr)
+
+
+def should_auto_persist_legacy(host: str) -> bool:
+    """Decide whether to add #v-legacy without manual tagging."""
+    if probe_algorithm_mismatch(host):
+        return True
+    fast_elapsed, fast_result = _probe_batch_ssh(host, LEGACY_SSH_OPTIONS)
+    if not _probe_reached_userauth(fast_result):
+        return False
+    if fast_elapsed > AUTO_LEGACY_FAST_PROBE_MAX:
+        return False
+    slow_elapsed, slow_result = _probe_batch_ssh(host)
+    if not _probe_reached_userauth(slow_result):
+        return True
+    return slow_elapsed >= AUTO_LEGACY_SLOW_DEFAULT_MIN
+
+
+def legacy_session_viable(result: ConnectResult) -> bool:
+    """True when a legacy-first interactive attempt reached SSH userauth."""
+    return _probe_reached_userauth(result) or (
+        result.returncode == 0 and not ssh_algorithm_mismatch(result)
+    )
 
 
 def persist_legacy_host(host: str) -> None:
@@ -2468,6 +2545,22 @@ def run_ssh_session(
     return ConnectResult(returncode, stderr=stderr)
 
 
+def _run_interactive_ssh(
+    host: str, *, legacy: bool, use_keychain: bool
+) -> ConnectResult:
+    ssh_args, env, use_askpass, use_pty_inject = prepare_ssh_invocation(
+        host, legacy=legacy, use_keychain=use_keychain, interactive=True
+    )
+    return run_ssh_session(
+        ssh_args,
+        env,
+        use_askpass,
+        exec_mode=False,
+        host=host,
+        use_pty_password_inject=use_pty_inject,
+    )
+
+
 def connect_host(
     host: str, use_keychain: bool = True, exec_mode: bool = True
 ) -> ConnectResult:
@@ -2476,7 +2569,7 @@ def connect_host(
     legacy = host_legacy_enabled(host)
 
     if exec_mode:
-        if not legacy and probe_algorithm_mismatch(host):
+        if not legacy and should_auto_persist_legacy(host):
             persist_legacy_host(host)
             legacy = True
         ssh_args, env, use_askpass, use_pty_inject = prepare_ssh_invocation(
@@ -2491,30 +2584,14 @@ def connect_host(
             use_pty_password_inject=use_pty_inject,
         )
 
-    ssh_args, env, use_askpass, use_pty_inject = prepare_ssh_invocation(
-        host, legacy=legacy, use_keychain=use_keychain, interactive=True
-    )
-    result = run_ssh_session(
-        ssh_args,
-        env,
-        use_askpass,
-        exec_mode=False,
-        host=host,
-        use_pty_password_inject=use_pty_inject,
-    )
-    if not legacy and ssh_algorithm_mismatch(result):
+    if legacy:
+        return _run_interactive_ssh(host, legacy=True, use_keychain=use_keychain)
+
+    result = _run_interactive_ssh(host, legacy=True, use_keychain=use_keychain)
+    if ssh_algorithm_mismatch(result):
+        return _run_interactive_ssh(host, legacy=False, use_keychain=use_keychain)
+    if legacy_session_viable(result):
         persist_legacy_host(host)
-        ssh_args, env, use_askpass, use_pty_inject = prepare_ssh_invocation(
-            host, legacy=True, use_keychain=use_keychain, interactive=True
-        )
-        result = run_ssh_session(
-            ssh_args,
-            env,
-            use_askpass,
-            exec_mode=False,
-            host=host,
-            use_pty_password_inject=use_pty_inject,
-        )
     return result
 
 
