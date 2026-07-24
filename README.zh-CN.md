@@ -1,15 +1,10 @@
 # vnssh
 
-macOS 终端 SSH 启动器。单文件 `vnssh.py` 分发，依赖系统 Python 3 与 OpenSSH，无第三方包。
+macOS 终端 SSH 启动器，支持 **Keychain 密码存储** 与 **会话操作日志**。单文件 `vnssh.py` 分发，依赖系统 Python 3 与 OpenSSH，无第三方包。
 
 当前版本：**1.0.0**（`vnssh --version`）。
 
 [English](README.md)
-
-### 特色
-
-- **密码存储策略** — 密码不写入 `hosts.conf`、`~/.ssh/config` 或脚本本身，而是存入 **macOS Keychain**（`svce=vnssh`，`acct=<Host 别名>`）；仅在连接时按需读取，且不会进入会话日志。配置可备份/版本管理，凭据由系统访问控制保护。
-- **操作 / 会话日志** — 登录成功后，将远端终端输出记录到 `~/.vnssh/sessions/`（按连接分文件）。认证提示与 OTP 不入日志；会话中实时落盘；退出 TUI 时自动按周归档为 `tar.gz`。可用 `VNSSH_SESSION_LOG` / `VNSSH_SESSION_ARCHIVE` 关闭。
 
 ## 功能
 

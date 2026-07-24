@@ -1,15 +1,10 @@
 # vnssh
 
-Terminal SSH launcher for macOS. Distributed as a single `vnssh.py` file; uses the system Python 3 and OpenSSH only—no third-party packages.
+Terminal SSH launcher for macOS with **Keychain password storage** and **session operation logs**. Distributed as a single `vnssh.py` file; uses the system Python 3 and OpenSSH only—no third-party packages.
 
 Current version: **1.0.0** (`vnssh --version`).
 
 [中文文档](README.zh-CN.md)
-
-### Highlights
-
-- **Password storage strategy** — passwords never live in `hosts.conf`, `~/.ssh/config`, or the script. They are stored in the **macOS Keychain** (`svce=vnssh`, `acct=<Host>`), read on demand when you connect, and never written into session logs. Config stays portable and version-control-friendly; secrets stay under OS access control.
-- **Session / operation logs** — after login succeeds, remote terminal output is recorded under `~/.vnssh/sessions/` (one file per connection). Auth prompts and OTP are excluded; logs flush during the session; completed weeks are auto-archived to `tar.gz` when you leave the TUI. Optional kill-switch via `VNSSH_SESSION_LOG` / `VNSSH_SESSION_ARCHIVE`.
 
 ## Features
 
