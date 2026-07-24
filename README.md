@@ -6,18 +6,6 @@ Current version: **1.0.1** (`vnssh --version`).
 
 [中文文档](README.zh-CN.md)
 
-### Changelog
-
-**1.0.1**
-
-- README lead sentence calls out Keychain password storage and session operation logs
-- README reorganized: intro → Quick start (requirements included) → features and other technical detail
-
-**1.0.0**
-
-- First numbered release: `vnssh version` / `--version` / `-V`, version in TUI title
-- Wizard fields accept UTF-8 / CJK input (Category, Name, etc.)
-
 ## Quick start
 
 **Requirements:** macOS · Python 3 · OpenSSH (`ssh`) · terminal at least 16 rows × 40 columns

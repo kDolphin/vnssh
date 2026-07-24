@@ -6,18 +6,6 @@ macOS 终端 SSH 启动器，支持 **Keychain 密码存储** 与 **会话操作
 
 [English](README.md)
 
-### 更新说明
-
-**1.0.1**
-
-- 开篇一句话点明 Keychain 密码存储与会话操作日志
-- README 重排：介绍 → 快速开始（含环境要求）→ 功能与其它技术细节
-
-**1.0.0**
-
-- 首个带版本号发布：`vnssh version` / `--version` / `-V`，TUI 标题显示版本
-- 新建/编辑向导支持 UTF-8 / 中文输入（Category、Name 等）
-
 ## 快速开始
 
 **环境要求：** macOS · Python 3 · OpenSSH（`ssh`） · 终端至少 16 行 × 40 列
