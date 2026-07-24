@@ -2883,23 +2883,45 @@ def read_line_input(
     initial: str = "",
     secret: bool = False,
 ) -> Optional[str]:
+    """Single-line editor; accepts UTF-8 (including CJK) via getch_utf8."""
     curses.curs_set(1)
     value = list(initial)
     pos = len(value)
 
+    def unit_width(ch: str) -> int:
+        return 1 if secret else char_display_width(ch)
+
+    def prefix_display_width(end: int) -> int:
+        return sum(unit_width(c) for c in value[:end])
+
     while True:
-        display = ("*" * len(value)) if secret else "".join(value)
+        # Horizontal scroll so the cursor stays within the field width.
+        start = 0
+        while prefix_display_width(pos) - prefix_display_width(start) >= max(1, width):
+            start += 1
+
+        visible: List[str] = []
+        used = 0
+        for i in range(start, len(value)):
+            w = unit_width(value[i])
+            if used + w > width:
+                break
+            visible.append("*" if secret else value[i])
+            used += w
+
         safe_addstr(stdscr, y, x, " " * width)
-        safe_addstr(stdscr, y, x, display[:width])
-        stdscr.move(y, x + min(pos, width - 1))
+        if visible:
+            safe_addstr(stdscr, y, x, "".join(visible))
+        cursor_x = x + (prefix_display_width(pos) - prefix_display_width(start))
+        if width > 0:
+            cursor_x = min(cursor_x, x + width - 1)
+        stdscr.move(y, max(x, cursor_x))
         stdscr.refresh()
 
-        ch = stdscr.getch()
+        char, ch = getch_utf8(stdscr)
         if ch in (10, 13, curses.KEY_ENTER):
             return "".join(value)
-        if ch in (27,):
-            return None
-        if ch in (3,):
+        if ch in (27, 3):
             return None
         if ch in (8, 127, curses.KEY_BACKSPACE):
             if pos > 0:
@@ -2922,8 +2944,9 @@ def read_line_input(
         if ch == curses.KEY_END:
             pos = len(value)
             continue
-        if 32 <= ch <= 126:
-            value.insert(pos, chr(ch))
+        # Accept printable Unicode (CJK, etc.), same rule as TUI search box.
+        if char and char.isprintable() and len(char) == 1:
+            value.insert(pos, char)
             pos += 1
 
 
