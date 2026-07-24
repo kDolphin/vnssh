@@ -2,9 +2,52 @@
 
 macOS 终端 SSH 启动器，支持 **Keychain 密码存储** 与 **会话操作日志**。单文件 `vnssh.py` 分发，依赖系统 Python 3 与 OpenSSH，无第三方包。
 
-当前版本：**1.0.0**（`vnssh --version`）。
+当前版本：**1.0.1**（`vnssh --version`）。
 
 [English](README.md)
+
+### 更新说明
+
+**1.0.1**
+
+- 开篇一句话点明 Keychain 密码存储与会话操作日志
+- README 重排：介绍 → 快速开始（含环境要求）→ 功能与其它技术细节
+
+**1.0.0**
+
+- 首个带版本号发布：`vnssh version` / `--version` / `-V`，TUI 标题显示版本
+- 新建/编辑向导支持 UTF-8 / 中文输入（Category、Name 等）
+
+## 快速开始
+
+**环境要求：** macOS · Python 3 · OpenSSH（`ssh`） · 终端至少 16 行 × 40 列
+
+```bash
+chmod +x vnssh.py
+cp vnssh.py ~/.local/bin/vnssh    # 可选：加入 PATH，命令名 vnssh
+./vnssh.py                         # 或直接：vnssh
+```
+
+确保 `~/.local/bin` 在 `PATH` 中（zsh 可在 `~/.zshrc` 添加 `export PATH="$HOME/.local/bin:$PATH"`）。
+
+首次运行自动创建 `~/.vnssh/`、`hosts.conf`，并在 `~/.ssh/config` 加入 `Include`（已存在则跳过）。**无需单独执行 `init`**。
+
+### 添加主机
+
+1. 运行 `vnssh`（标题栏显示版本号）
+2. **Ctrl-N** 新建
+3. 填写 category、名称、地址、用户、认证（category / 名称支持中文）；密码可选，存入 Keychain
+4. 选中主机，**Enter** 连接
+
+### 命令行速查
+
+```bash
+vnssh list
+vnssh connect <Host名>
+vnssh --version
+```
+
+完整命令见 [命令行](#命令行)。
 
 ## 功能
 
@@ -105,32 +148,6 @@ vnssh import --force hosts.csv          # 覆盖 hosts.conf 中已有同名 Host
 | 已存在于 `~/.ssh/config`（ext） | 不修改其配置；CSV 含密码列时仅导入 Keychain |
 
 表头支持常见别名（如 `folder` → `category`）。建议先 `--dry-run` 核对统计。
-
-## 环境要求
-
-- macOS
-- Python 3
-- OpenSSH（`ssh`）
-- 终端窗口建议 ≥ 16 行 × 40 列
-
-## 快速开始
-
-```bash
-chmod +x vnssh.py
-cp vnssh.py ~/.local/bin/vnssh    # 可选：加入 PATH，命令名 vnssh
-./vnssh.py                         # 或直接：vnssh
-```
-
-确保 `~/.local/bin` 在 `PATH` 中（zsh 可在 `~/.zshrc` 添加 `export PATH="$HOME/.local/bin:$PATH"`）。
-
-首次运行自动创建 `~/.vnssh/`、`hosts.conf`，并在 `~/.ssh/config` 加入 `Include`（已存在则跳过）。**无需单独执行 `init`**。
-
-### 添加主机
-
-1. 运行 `vnssh`（标题栏显示版本号）
-2. **Ctrl-N** 新建
-3. 填写 category、名称、地址、用户、认证（category / 名称支持中文）；密码可选，存入 Keychain
-4. 选中主机，**Enter** 连接
 
 ## 配置文件
 

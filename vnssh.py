@@ -32,7 +32,7 @@ from typing import Dict, List, Optional, Tuple
 # Paths & constants
 # ---------------------------------------------------------------------------
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 VNSSH_DIR = Path.home() / ".vnssh"
 VNSSH_TERMINAL_TITLE = f"vnssh {__version__}"

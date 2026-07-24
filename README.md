@@ -2,9 +2,52 @@
 
 Terminal SSH launcher for macOS with **Keychain password storage** and **session operation logs**. Distributed as a single `vnssh.py` file; uses the system Python 3 and OpenSSH only—no third-party packages.
 
-Current version: **1.0.0** (`vnssh --version`).
+Current version: **1.0.1** (`vnssh --version`).
 
 [中文文档](README.zh-CN.md)
+
+### Changelog
+
+**1.0.1**
+
+- README lead sentence calls out Keychain password storage and session operation logs
+- README reorganized: intro → Quick start (requirements included) → features and other technical detail
+
+**1.0.0**
+
+- First numbered release: `vnssh version` / `--version` / `-V`, version in TUI title
+- Wizard fields accept UTF-8 / CJK input (Category, Name, etc.)
+
+## Quick start
+
+**Requirements:** macOS · Python 3 · OpenSSH (`ssh`) · terminal at least 16 rows × 40 columns
+
+```bash
+chmod +x vnssh.py
+cp vnssh.py ~/.local/bin/vnssh    # optional: on PATH as vnssh
+./vnssh.py                         # or simply: vnssh
+```
+
+Ensure `~/.local/bin` is on your `PATH` (zsh example in `~/.zshrc`: `export PATH="$HOME/.local/bin:$PATH"`).
+
+First run creates `~/.vnssh/`, `hosts.conf`, and the `Include` line in `~/.ssh/config` if missing. **No separate `init` is required** for daily use.
+
+### Add a host
+
+1. Run `vnssh` (title bar shows the version)
+2. Press **Ctrl-N** to create a host
+3. Enter category, name, address, user, and auth (Unicode/CJK is fine for category and name); optional password goes to Keychain
+4. Select the host and press **Enter** to connect
+
+### CLI cheat sheet
+
+```bash
+vnssh list
+vnssh connect <Host>
+vnssh --version
+```
+
+More commands: [CLI](#cli).
 
 ## Features
 
@@ -105,32 +148,6 @@ Import rules:
 | Already in `~/.ssh/config` (ext) | Config unchanged; password column updates Keychain only |
 
 Common header aliases are accepted (e.g. `folder` → `category`). Run `--dry-run` first to verify the action summary.
-
-## Requirements
-
-- macOS
-- Python 3
-- OpenSSH (`ssh`)
-- Terminal at least 16 rows × 40 columns
-
-## Quick start
-
-```bash
-chmod +x vnssh.py
-cp vnssh.py ~/.local/bin/vnssh    # optional: on PATH as vnssh
-./vnssh.py                         # or simply: vnssh
-```
-
-Ensure `~/.local/bin` is on your `PATH` (zsh example in `~/.zshrc`: `export PATH="$HOME/.local/bin:$PATH"`).
-
-First run creates `~/.vnssh/`, `hosts.conf`, and the `Include` line in `~/.ssh/config` if missing. **No separate `init` is required** for daily use.
-
-### Add a host
-
-1. Run `vnssh` (title bar shows the version)
-2. Press **Ctrl-N** to create a host
-3. Enter category, name, address, user, and auth (Unicode/CJK is fine for category and name); optional password goes to Keychain
-4. Select the host and press **Enter** to connect
 
 ## Configuration
 
