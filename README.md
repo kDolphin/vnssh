@@ -2,17 +2,21 @@
 
 Terminal SSH launcher for macOS. Distributed as a single `vnssh.py` file; uses the system Python 3 and OpenSSH only—no third-party packages.
 
+Current version: **1.0.0** (`vnssh --version`).
+
 [中文文档](README.zh-CN.md)
 
 ## Features
 
 ### TUI
 
-vnssh presents a full-screen TUI host list with live filtering. As you type in the search box, the list narrows immediately and sorts by relevance (exact `Host` alias first, then prefix and substring matches, then recent-use history).
+vnssh presents a full-screen TUI host list with live filtering. As you type in the search box, the list narrows immediately and sorts by relevance (exact `Host` alias first, then prefix and substring matches, then recent-use history). The title bar shows `vnssh <version>`.
 
 Search spans **Category**, **Host alias**, **HostName**, **User**, **Port**, and the combined address label. Matching is case-insensitive substring search over those fields. Host names and categories that contain **CJK characters** also get a built-in romanization index, so an ASCII query can match labels you do not have an input method for (e.g. matching initials or syllables of a Chinese category name).
 
 With an empty search box, hosts are sorted by recent connections.
+
+New/edit wizards (Ctrl-N / **e**) accept **UTF-8 input**, including Chinese and other CJK text, in fields such as **Category** and **Name**.
 
 ### Keychain passwords
 
@@ -123,9 +127,9 @@ First run creates `~/.vnssh/`, `hosts.conf`, and the `Include` line in `~/.ssh/c
 
 ### Add a host
 
-1. Run `vnssh`
+1. Run `vnssh` (title bar shows the version)
 2. Press **Ctrl-N** to create a host
-3. Enter category, name, address, user, and auth; optional password goes to Keychain
+3. Enter category, name, address, user, and auth (Unicode/CJK is fine for category and name); optional password goes to Keychain
 4. Select the host and press **Enter** to connect
 
 ## Configuration
@@ -159,6 +163,8 @@ Host bastion-example
     Port 8321
 ```
 
+Category comments may use CJK, for example `#v-f:生产环境`.
+
 ## TUI shortcuts
 
 | Key | Action |
@@ -177,14 +183,27 @@ Badges: **p** = password in Keychain, **k** = SSH key configured, **ext** = exte
 ## CLI
 
 ```bash
+vnssh                         # open TUI
 vnssh list
 vnssh connect <Host>
 vnssh import hosts.csv
 vnssh import --dry-run file.csv
 vnssh init
+vnssh version                 # print version
+vnssh --version               # same
+vnssh -V                      # same
 ```
 
-For day-to-day browsing, search, and connect, the TUI is usually easier. The CLI is better for scripts, bulk import, or a quick non-interactive connect to one host.
+| Command | Description |
+|---------|-------------|
+| *(no args)* | Launch the full-screen TUI |
+| `list` | Print hosts (non-interactive) |
+| `connect <Host>` | Connect to one host |
+| `import [options] <file.csv>` | Bulk import; supports `--dry-run` and `--force` |
+| `init` | Ensure setup and write the CSV template |
+| `version` / `--version` / `-V` | Print `vnssh <version>` and exit |
+
+For day-to-day browsing, search, and connect, the TUI is usually easier. The CLI is better for scripts, bulk import, version checks, or a quick non-interactive connect to one host.
 
 ## Security
 

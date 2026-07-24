@@ -32,8 +32,10 @@ from typing import Dict, List, Optional, Tuple
 # Paths & constants
 # ---------------------------------------------------------------------------
 
+__version__ = "1.0.0"
+
 VNSSH_DIR = Path.home() / ".vnssh"
-VNSSH_TERMINAL_TITLE = "vnssh"
+VNSSH_TERMINAL_TITLE = f"vnssh {__version__}"
 SESSIONS_DIR = VNSSH_DIR / "sessions"
 HOSTS_CONF = VNSSH_DIR / "hosts.conf"
 HISTORY_FILE = VNSSH_DIR / "history.json"
@@ -3441,7 +3443,7 @@ class MainUI:
         stdscr.clear()
         _height, width = stdscr.getmaxyx()
         layout = self.layout()
-        draw_box_title(stdscr, "vnssh")
+        draw_box_title(stdscr, f"vnssh {__version__}")
         curses.curs_set(0)
 
         self.draw_table_header(stdscr, width)
@@ -3971,12 +3973,27 @@ def cmd_import(argv: List[str]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def cmd_version() -> None:
+    print(f"vnssh {__version__}")
+
+
+def print_usage() -> None:
+    print(
+        "Usage: vnssh | vnssh init | vnssh list | vnssh connect <Host> | "
+        "vnssh import [--dry-run] [--force] <file.csv> | vnssh version\n"
+        "       vnssh --version | -V"
+    )
+
+
 def main() -> None:
     if is_askpass_mode() or "--askpass" in sys.argv:
         askpass_main()
 
     if len(sys.argv) > 1:
         cmd = sys.argv[1]
+        if cmd in ("version", "--version", "-V"):
+            cmd_version()
+            return
         if cmd == "init":
             cmd_init()
             return
@@ -3989,10 +4006,7 @@ def main() -> None:
         if cmd == "import":
             cmd_import(sys.argv[2:])
             return
-        print(
-            "Usage: vnssh | vnssh init | vnssh list | vnssh connect <Host> | "
-            "vnssh import [--dry-run] [--force] <file.csv>"
-        )
+        print_usage()
         sys.exit(1)
 
     curses.wrapper(main_curses)

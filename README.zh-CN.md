@@ -2,17 +2,21 @@
 
 macOS 终端 SSH 启动器。单文件 `vnssh.py` 分发，依赖系统 Python 3 与 OpenSSH，无第三方包。
 
+当前版本：**1.0.0**（`vnssh --version`）。
+
 [English](README.md)
 
 ## 功能
 
 ### TUI 界面
 
-vnssh 以全屏 TUI 展示主机列表，支持实时过滤。搜索框输入任意片段后，列表即时收窄并按相关度排序（精确匹配 Host 别名优先，其次前缀与子串匹配，再结合最近使用记录）。
+vnssh 以全屏 TUI 展示主机列表，支持实时过滤。搜索框输入任意片段后，列表即时收窄并按相关度排序（精确匹配 Host 别名优先，其次前缀与子串匹配，再结合最近使用记录）。标题栏显示 `vnssh <版本号>`。
 
 可搜索字段包括：**Category**、**Host 别名**、**HostName**、**User**、**Port** 及组合标签。中文主机名与 Category 额外建立拼音索引，支持**全拼**与**首字母**匹配（例如 Category「生产环境」可用 `sc`、`schj` 等片段命中）。
 
 未输入搜索词时，列表按最近连接记录排序。
+
+新建 / 编辑向导（Ctrl-N / **e**）的输入框支持 **UTF-8**，**Category**、**Name** 等字段可直接输入中文及其他 CJK 字符。
 
 ### Keychain 密码
 
@@ -123,9 +127,9 @@ cp vnssh.py ~/.local/bin/vnssh    # 可选：加入 PATH，命令名 vnssh
 
 ### 添加主机
 
-1. 运行 `vnssh`
+1. 运行 `vnssh`（标题栏显示版本号）
 2. **Ctrl-N** 新建
-3. 填写 category、名称、地址、用户、认证；密码可选，存入 Keychain
+3. 填写 category、名称、地址、用户、认证（category / 名称支持中文）；密码可选，存入 Keychain
 4. 选中主机，**Enter** 连接
 
 ## 配置文件
@@ -151,13 +155,15 @@ vnssh 涉及的文件路径：
 示例（三条注释可按需省略）：
 
 ```sshconfig
-#v-f:Production
+#v-f:生产环境
 #v-2fa
 Host bastion-example
     HostName 203.0.113.10
     User alice
     Port 8321
 ```
+
+Category 注释可使用中文，例如 `#v-f:生产环境`。
 
 ## TUI 快捷键
 
@@ -177,14 +183,27 @@ Host bastion-example
 ## 命令行
 
 ```bash
+vnssh                         # 打开 TUI
 vnssh list
 vnssh connect <Host名>
 vnssh import hosts.csv
 vnssh import --dry-run file.csv
 vnssh init
+vnssh version                 # 打印版本
+vnssh --version               # 同上
+vnssh -V                      # 同上
 ```
 
-日常浏览、搜索与连接建议直接使用 TUI；命令行适合脚本调用、批量导入或在无交互环境下快速连接单个 Host。
+| 命令 | 说明 |
+|------|------|
+| *(无参数)* | 启动全屏 TUI |
+| `list` | 非交互列出主机 |
+| `connect <Host>` | 连接指定主机 |
+| `import [选项] <file.csv>` | 批量导入；支持 `--dry-run`、`--force` |
+| `init` | 初始化环境并写出 CSV 模板 |
+| `version` / `--version` / `-V` | 打印 `vnssh <版本号>` 后退出 |
+
+日常浏览、搜索与连接建议直接使用 TUI；命令行适合脚本调用、批量导入、查看版本，或在无交互环境下快速连接单个 Host。
 
 ## 安全说明
 
