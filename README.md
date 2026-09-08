@@ -2,7 +2,7 @@
 
 Terminal SSH launcher for macOS with **Keychain password storage** and **session operation logs**. Distributed as a single `vnssh.py` file; uses the system Python 3 and OpenSSH only—no third-party packages.
 
-Current version: **1.0.1** (`vnssh --version`).
+Current version: **1.0.2** (`vnssh --version`).
 
 [中文文档](README.zh-CN.md)
 
@@ -25,7 +25,7 @@ First run creates `~/.vnssh/`, `hosts.conf`, and the `Include` line in `~/.ssh/c
 1. Run `vnssh` (title bar shows the version)
 2. Press **Ctrl-N** to create a host
 3. Enter category, name, address, user, and auth (Unicode/CJK is fine for category and name); optional password goes to Keychain
-4. Select the host and press **Enter** to connect
+4. Select the host and press **Enter** to connect. While connecting, **Ctrl-C** cancels and returns to the host list. Network errors and authentication failures also return to the list instead of leaving the terminal stuck.
 
 ### CLI cheat sheet
 
@@ -68,6 +68,17 @@ vnssh does not implement a private SSH protocol. Connections and on-disk config 
 - **Works without vnssh**: if you remove vnssh but keep `hosts.conf` and the `Include` line, `ssh <Host>` still works. Password hosts need your own input method (Keychain integration is provided by vnssh).
 
 Entries in `~/.ssh/config` that vnssh does not manage appear in the TUI marked **ext**.
+
+### Connect, cancel, and errors
+
+TUI connects run OpenSSH on a PTY and always try to return to the host list when the attempt ends—success, failure, or cancel—rather than leaving a frozen SSH screen.
+
+- **Cancel**: before a remote shell is up, **Ctrl-C** stops the local `ssh` process and returns to the TUI. After login, Ctrl-C is forwarded to the remote session as usual.
+- **Auth / extra prompts**: on a second Keychain/askpass prompt (OTP, retry, etc.), **Ctrl-C** or **Esc** cancels instead of sitting in a line buffer.
+- **Hard failures**: messages such as connection timed out, connection refused, no route to host, network unreachable, permission denied, or authentication failed (including common Chinese phrases such as 密码错误 / 认证失败) end the attempt and show a status-bar error.
+- **Watchdog**: if nothing is happening and you are not being asked to type (password, OTP, or host-key `yes/no`), the pre-login attempt is stopped after about **20 seconds**. OpenSSH `ConnectTimeout` remains **5 seconds** for the TCP handshake. Waiting for you to type does not consume that 20-second budget.
+
+A line `Connecting... (Ctrl-C to cancel)` is printed at the start of each attempt.
 
 ### Legacy protocol auto-compatibility
 
@@ -182,6 +193,7 @@ Category comments may use CJK, for example `#v-f:生产环境`.
 | PgUp / PgDn | Page list |
 | Ctrl-B / Ctrl-F | Page list (same as PgUp / PgDn) |
 | Esc | Clear search; quit when search is empty |
+| Ctrl-C | While connecting (before a remote shell): cancel and return to the list |
 
 Badges: **p** = password in Keychain, **k** = SSH key configured, **ext** = external SSH config.
 
@@ -236,8 +248,15 @@ For day-to-day browsing, search, and connect, the TUI is usually easier. The CLI
 
 - The TUI requires at least 16 rows × 40 columns (`MIN_TERMINAL_HEIGHT`). Enlarge the window and restart.
 
+**Stuck on connect / cannot return to the TUI**
+
+- Press **Ctrl-C** while the `Connecting...` line is showing (before a remote shell). That aborts local `ssh` and redraws the list.
+- Network failures and auth errors should return automatically; the reason appears on the status bar.
+- If a host is waiting for OTP or `yes/no`, type the response or Ctrl-C to cancel. After login, Ctrl-C goes to the remote process, not vnssh.
+
 **Authentication failed / Permission denied**
 
+- You should land back on the host list with a status-bar error (not a stuck password prompt).
 - Press **e** and verify `User`, `HostName`, port, and `auth` mode.
 - Key auth: confirm `IdentityFile` exists and key permissions are tight (typically mode `600`).
 - Password auth: check Keychain Access for service `vnssh` and the matching `Host` account; no **p** badge means no Keychain entry.

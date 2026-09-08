@@ -32,7 +32,7 @@ from typing import Dict, List, Optional, Tuple
 # Paths & constants
 # ---------------------------------------------------------------------------
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 VNSSH_DIR = Path.home() / ".vnssh"
 VNSSH_TERMINAL_TITLE = f"vnssh {__version__}"
@@ -49,8 +49,15 @@ _DEPRECATED_TWOFA_COMMENT_PREFIX = "#v-bastion"
 SSH_CONNECT_OPTIONS = (
     ("StrictHostKeyChecking", "accept-new"),
     ("ConnectTimeout", "5"),
+    ("ConnectionAttempts", "1"),
 )
 PROBE_CONNECT_TIMEOUT = 2
+PROBE_PROCESS_TIMEOUT = PROBE_CONNECT_TIMEOUT + 3
+# Pre-auth: DNS/TCP/kex/password can hang with no usable Ctrl-C (raw PTY).
+SSH_PRE_SESSION_DEADLINE = 20.0
+SSH_FATAL_DRAIN = 0.4
+SSH_REAP_TIMEOUT = 1.5
+SSH_CANCEL_HINT = b"Connecting... (Ctrl-C to cancel)\r\n"
 AUTO_LEGACY_FAST_PROBE_MAX = 5.0
 AUTO_LEGACY_SLOW_DEFAULT_MIN = 5.0
 LEGACY_SSH_OPTIONS = (
@@ -1097,20 +1104,25 @@ def cleanup_askpass_session(session: str) -> None:
 
 
 def read_interactive_line_from_tty(*, echo: bool = True) -> Optional[str]:
-    """Read one line from the real terminal (2FA / extra kbdint prompts)."""
+    """Read one line from the real terminal (2FA / extra kbdint prompts).
+
+    Canonical mode plus the parent's raw PTY leaves ISIG off, so Ctrl-C would
+    otherwise sit in the line buffer and look like a freeze. Read byte-wise
+    and treat Ctrl-C / Esc / empty Ctrl-D as cancel.
+    """
     try:
         fd = os.open("/dev/tty", os.O_RDWR)
     except OSError:
         return None
     try:
-        attrs = termios.tcgetattr(fd)
         saved = termios.tcgetattr(fd)
-        attrs[3] |= termios.ICANON
+        attrs = termios.tcgetattr(fd)
+        attrs[3] &= ~(
+            termios.ICANON | termios.ISIG | termios.IEXTEN | termios.ECHO
+        )
         attrs[3] &= ~termios.NOFLSH
-        if echo:
-            attrs[3] |= termios.ECHO
-        else:
-            attrs[3] &= ~termios.ECHO
+        attrs[6][termios.VMIN] = 1
+        attrs[6][termios.VTIME] = 0
         termios.tcsetattr(fd, termios.TCSADRAIN, attrs)
         chunks: List[bytes] = []
         try:
@@ -1118,9 +1130,25 @@ def read_interactive_line_from_tty(*, echo: bool = True) -> Optional[str]:
                 ch = os.read(fd, 1)
                 if not ch or ch in (b"\n", b"\r"):
                     break
+                if ch in (b"\x03", b"\x1b"):
+                    if echo:
+                        os.write(fd, b"\r\n")
+                    return None
+                if ch == b"\x04":
+                    break
+                if ch in (b"\x7f", b"\x08"):
+                    if chunks:
+                        chunks.pop()
+                        if echo:
+                            os.write(fd, b"\b \b")
+                    continue
                 chunks.append(ch)
+                if echo and ch[0] >= 32:
+                    os.write(fd, ch)
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+    except OSError:
+        return None
     finally:
         os.close(fd)
     if not chunks:
@@ -1266,7 +1294,13 @@ def _probe_batch_ssh(
 ) -> Tuple[float, ConnectResult]:
     args = _batch_ssh_base_args(host, ssh_options=ssh_options)
     start = time.monotonic()
-    proc = subprocess.run(args, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(
+            args, capture_output=True, text=True, timeout=PROBE_PROCESS_TIMEOUT
+        )
+    except subprocess.TimeoutExpired:
+        elapsed = time.monotonic() - start
+        return elapsed, ConnectResult(255, "Connection timed out")
     elapsed = time.monotonic() - start
     return elapsed, ConnectResult(proc.returncode, proc.stderr)
 
@@ -1668,7 +1702,12 @@ def probe_algorithm_mismatch(host: str) -> bool:
             ("KexAlgorithms", "curve25519-sha256,diffie-hellman-group16-sha512"),
         ),
     )
-    proc = subprocess.run(args, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(
+            args, capture_output=True, text=True, timeout=PROBE_PROCESS_TIMEOUT
+        )
+    except subprocess.TimeoutExpired:
+        return False
     return ssh_algorithm_mismatch(ConnectResult(proc.returncode, proc.stderr))
 
 
@@ -1776,7 +1815,33 @@ _AUTH_FAILURE_MARKERS = (
     re.compile(r"(?i)passwordexpired"),
     re.compile(r"(?i)received disconnect"),
     re.compile(r"(?i)authentication failed"),
+    re.compile(r"(?i)permission denied"),
+    re.compile(r"(?i)too many authentication failures"),
+    re.compile(r"(?i)login incorrect"),
+    re.compile(r"(?i)access denied"),
     re.compile(r"\u5bc6\u7801\u8fc7\u671f"),
+    re.compile(r"\u5bc6\u7801\u9519\u8bef"),
+    re.compile(r"\u8ba4\u8bc1\u5931\u8d25"),
+    re.compile(r"\u767b\u5f55\u5931\u8d25"),
+)
+
+_PRE_SESSION_FATAL_MARKERS = _AUTH_FAILURE_MARKERS + (
+    re.compile(r"(?i)connection timed out"),
+    re.compile(r"(?i)operation timed out"),
+    re.compile(r"(?i)connection refused"),
+    re.compile(r"(?i)no route to host"),
+    re.compile(r"(?i)network is unreachable"),
+    re.compile(r"(?i)could not resolve hostname"),
+    re.compile(r"(?i)name or service not known"),
+    re.compile(r"(?i)host key verification failed"),
+    re.compile(r"(?i)kex_exchange_identification"),
+    re.compile(r"(?i)banner exchange"),
+    re.compile(r"(?i)connection reset"),
+    re.compile(r"(?i)connection closed by"),
+    re.compile(r"(?i)disconnected from"),
+    re.compile(r"(?i)broken pipe"),
+    re.compile(r"\u7f51\u7edc\u4e0d\u53ef\u8fbe"),
+    re.compile(r"\u65e0\u6cd5\u89e3\u6790"),
 )
 
 _AUTO_PASSWORD_DELAY = 0.45
@@ -2194,6 +2259,111 @@ def archive_pending_session_weeks(week_labels: List[str]) -> None:
             )
 
 
+def ssh_pre_session_fatal(recent_text: str) -> bool:
+    """True when SSH printed a hard failure before an interactive session."""
+    clean = _strip_ansi(recent_text)
+    return any(marker.search(clean) for marker in _PRE_SESSION_FATAL_MARKERS)
+
+
+def ssh_waiting_for_user_input(
+    recent_text: str,
+    *,
+    auto_password: bool,
+    password_sent: bool,
+) -> bool:
+    """Pause connect deadline while the user must type (OTP, password, yes/no)."""
+    if _has_active_verification_prompt(recent_text):
+        return True
+    tail = _strip_ansi(recent_text)[-2000:]
+    if re.search(r"(?i)are you sure you want to continue connecting", tail):
+        return True
+    if re.search(r"(?i)the authenticity of host", tail) and not re.search(
+        r"(?i)permanently added", tail
+    ):
+        return True
+    if auto_password and password_sent:
+        return False
+    return bool(
+        _password_prompt_signature(recent_text, allow_standard_password=True)
+    )
+
+
+def _fd_set_nonblocking(fd: int) -> None:
+    try:
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    except OSError:
+        pass
+
+
+def _write_fd(fd: int, data: bytes, *, timeout: float = 0.5) -> None:
+    view = memoryview(data)
+    deadline = time.monotonic() + timeout
+    while view:
+        try:
+            written = os.write(fd, view)
+        except BlockingIOError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            try:
+                select.select([], [fd], [], min(0.05, remaining))
+            except (OSError, ValueError, InterruptedError):
+                return
+            continue
+        except OSError:
+            return
+        if written <= 0:
+            return
+        view = view[written:]
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _terminate_ssh_child(pid: int, sig: int = signal.SIGTERM) -> None:
+    """Signal the ssh process group without touching the vnssh TUI group."""
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        return
+    try:
+        if pgid != os.getpgrp():
+            os.killpg(pgid, sig)
+            return
+    except OSError:
+        pass
+    try:
+        os.kill(pid, sig)
+    except OSError:
+        pass
+
+
+def _reap_pid(pid: int, timeout: float) -> int:
+    deadline = time.monotonic() + timeout
+    status = 0
+    while True:
+        try:
+            waited, status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return 0
+        if waited:
+            return status
+        if time.monotonic() >= deadline:
+            _terminate_ssh_child(pid, signal.SIGKILL)
+            try:
+                _, status = os.waitpid(pid, 0)
+            except ChildProcessError:
+                return 0
+            return status
+        time.sleep(0.05)
+
+
 def run_ssh_with_tty(
     argv: List[str],
     env: Dict[str, str],
@@ -2222,7 +2392,19 @@ def run_ssh_with_tty(
     password_prompt_sig: Optional[str] = None
     tty_fd = open_controlling_tty()
     if tty_fd is None and not sys.stdin.isatty():
-        proc = subprocess.run(argv, env=env, capture_output=True, text=True)
+        try:
+            proc = subprocess.run(
+                argv,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=SSH_PRE_SESSION_DEADLINE,
+            )
+        except subprocess.TimeoutExpired as exc:
+            err = ((exc.stderr or exc.stdout or "") or "Connection timed out")
+            if isinstance(err, bytes):
+                err = err.decode("utf-8", errors="replace")
+            return 255, str(err).strip() or "Connection timed out"
         err = (proc.stderr or proc.stdout or "").strip()
         return proc.returncode, err
 
@@ -2250,6 +2432,7 @@ def run_ssh_with_tty(
 
     def tick_auto_password() -> None:
         nonlocal password_sent, password_pending_since, password_prompt_sig
+        nonlocal connect_deadline
         if not auto_password or password_sent or not recent_output:
             return
         sig = _password_prompt_signature(
@@ -2272,9 +2455,10 @@ def run_ssh_with_tty(
         ):
             password_sent = True
             payload = (auto_password + "\n").encode("utf-8")
-            os.write(master_fd, payload)
+            _write_fd(master_fd, payload, timeout=1.0)
             output.extend(payload)
             password_pending_since = None
+            connect_deadline = max(connect_deadline, time.monotonic() + 8.0)
 
     log_file: Optional[object] = None
     logging_active = False
@@ -2422,53 +2606,169 @@ def run_ssh_with_tty(
         if try_start_direct_session_log():
             write_session_log(data)
 
+    _fd_set_nonblocking(master_fd)
+    session_established = False
+    aborted = False
+    abort_code = 0
+    kill_at: Optional[float] = None
+    child_status: Optional[int] = None
+    recent_output = ""
+    connect_deadline = time.monotonic() + SSH_PRE_SESSION_DEADLINE
+    old_int = signal.SIG_DFL
+
+    def on_sigint(signum: int, frame: Optional[object]) -> None:
+        nonlocal aborted, abort_code
+        if not session_established:
+            aborted = True
+            abort_code = 130
+
+    def request_stop() -> None:
+        nonlocal kill_at
+        if kill_at is None:
+            kill_at = time.monotonic()
+            _terminate_ssh_child(pid, signal.SIGTERM)
+
     try:
         saved_tty = termios.tcgetattr(terminal_fd)
         tty.setraw(terminal_fd, termios.TCSADRAIN)
         old_winch = signal.signal(signal.SIGWINCH, on_winch)
-        recent_output = ""
+        old_int = signal.signal(signal.SIGINT, on_sigint)
+        _write_fd(terminal_fd, SSH_CANCEL_HINT)
+        fatal_at: Optional[float] = None
         while True:
+            now = time.monotonic()
             if resize_pending:
                 resize_pending = False
                 sync_pty_window_size(master_fd, terminal_fd)
+
+            if not session_established and recent_output:
+                if ssh_pre_session_fatal(recent_output):
+                    pass
+                elif (
+                    bastion_ui_seen
+                    or logging_active
+                    or _bastion_ui_visible(recent_output)
+                    or _session_ready_for_log(
+                        recent_output,
+                        auto_password=bool(auto_password),
+                        password_sent=password_sent,
+                        twofa_enabled=twofa_enabled,
+                    )
+                ):
+                    session_established = True
+
+            if not session_established:
+                if ssh_pre_session_fatal(recent_output):
+                    if fatal_at is None:
+                        fatal_at = now
+                    if now - fatal_at >= SSH_FATAL_DRAIN:
+                        request_stop()
+                elif aborted:
+                    request_stop()
+                elif not ssh_waiting_for_user_input(
+                    recent_output,
+                    auto_password=bool(auto_password),
+                    password_sent=password_sent,
+                ) and now >= connect_deadline:
+                    if not ssh_pre_session_fatal(recent_output):
+                        notice = b"\r\nConnection timed out\r\n"
+                        output.extend(notice)
+                        _write_fd(terminal_fd, notice)
+                        recent_output = output.decode("utf-8", errors="replace")
+                    request_stop()
+
+            if child_status is None:
+                try:
+                    waited, st = os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                    child_status = 0
+                    waited = pid
+                if waited:
+                    child_status = st
+
+            if kill_at is not None and now - kill_at >= SSH_REAP_TIMEOUT:
+                _terminate_ssh_child(pid, signal.SIGKILL)
+
             relay_fds = [master_fd]
-            if askpass_lock is None or not askpass_lock.exists():
+            askpass_locked = askpass_lock is not None and askpass_lock.exists()
+            if not askpass_locked:
                 relay_fds.append(terminal_fd)
-            readable, _, _ = select.select(relay_fds, [], [], 0.2)
+            try:
+                readable, _, _ = select.select(relay_fds, [], [], 0.2)
+            except InterruptedError:
+                readable = []
             if logging_active:
                 flush_session_log_buffer()
+            got_master = False
             if master_fd in readable:
                 try:
                     data = os.read(master_fd, 8192)
+                except BlockingIOError:
+                    data = None
                 except OSError:
                     break
-                if not data:
+                if data is None:
+                    pass
+                elif not data:
                     break
-                output.extend(data)
-                os.write(terminal_fd, data)
-                if len(output) > _RECENT_OUTPUT_WINDOW:
-                    del output[: len(output) - _RECENT_OUTPUT_WINDOW]
-                recent_output = output.decode("utf-8", errors="replace")
-                update_session_log(data)
+                else:
+                    got_master = True
+                    output.extend(data)
+                    _write_fd(terminal_fd, data)
+                    if len(output) > _RECENT_OUTPUT_WINDOW:
+                        del output[: len(output) - _RECENT_OUTPUT_WINDOW]
+                    recent_output = output.decode("utf-8", errors="replace")
+                    update_session_log(data)
+            if child_status is not None and not got_master:
+                break
             tick_auto_password()
             if terminal_fd in readable:
                 try:
                     data = os.read(terminal_fd, 8192)
+                except BlockingIOError:
+                    data = b""
                 except OSError:
-                    break
-                if not data:
-                    break
-                os.write(master_fd, data)
+                    data = b""
+                    if not session_established:
+                        aborted = True
+                        abort_code = 130
+                        request_stop()
+                if data:
+                    if not session_established and b"\x03" in data:
+                        aborted = True
+                        abort_code = 130
+                        request_stop()
+                    else:
+                        _write_fd(master_fd, data)
     finally:
         signal.signal(signal.SIGWINCH, old_winch)
+        signal.signal(signal.SIGINT, old_int)
         restore_tty_attrs(terminal_fd, saved_tty)
         finalize_session_log_file()
+        if child_status is None and _pid_alive(pid):
+            _terminate_ssh_child(pid, signal.SIGTERM)
         if tty_fd is not None:
-            os.close(tty_fd)
-        os.close(master_fd)
-        _, status = os.waitpid(pid, 0)
+            try:
+                os.close(tty_fd)
+            except OSError:
+                pass
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+        if child_status is None:
+            child_status = _reap_pid(pid, SSH_REAP_TIMEOUT)
+        else:
+            # Ensure no zombie if we already saw WNOHANG success.
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
 
     err_text = output.decode("utf-8", errors="replace").strip()
+    status = child_status if child_status is not None else 0
+    if abort_code == 130:
+        return 130, err_text
     if os.WIFEXITED(status):
         return os.WEXITSTATUS(status), err_text
     if os.WIFSIGNALED(status):
@@ -2587,6 +2887,8 @@ def connect_host(
         return _run_interactive_ssh(host, legacy=True, use_keychain=use_keychain)
 
     result = _run_interactive_ssh(host, legacy=True, use_keychain=use_keychain)
+    if result.returncode == 130:
+        return result
     if ssh_algorithm_mismatch(result):
         return _run_interactive_ssh(host, legacy=False, use_keychain=use_keychain)
     if legacy_session_viable(result):
@@ -3263,15 +3565,18 @@ class MainUI:
     def resume_after_ssh(self) -> None:
         clear_terminal_screen()
         set_terminal_title(VNSSH_TERMINAL_TITLE)
-        curses.reset_prog_mode()
-        curses.cbreak()
-        self.stdscr.keypad(True)
-        curses.set_escdelay(25)
-        init_colors()
-        self.stdscr.clear()
-        self.focus_input()
-        self.reload_connections()
-        self.draw()
+        try:
+            curses.reset_prog_mode()
+            curses.cbreak()
+            self.stdscr.keypad(True)
+            curses.set_escdelay(25)
+            init_colors()
+            self.stdscr.clear()
+            self.focus_input()
+            self.reload_connections()
+            self.draw()
+        except curses.error:
+            pass
 
     def status_text(self, layout: Dict[str, int]) -> str:
         total = len(self.filtered)
@@ -3496,11 +3801,18 @@ class MainUI:
 
     def connect_selected(self, conn: Connection) -> None:
         self.message = ""
+        result = ConnectResult(130, "")
         curses.def_prog_mode()
         curses.endwin()
         prepare_terminal_for_shell()
-        result = connect_host(conn.host, exec_mode=False)
-        self.resume_after_ssh()
+        try:
+            result = connect_host(conn.host, exec_mode=False)
+        except KeyboardInterrupt:
+            result = ConnectResult(130, "")
+        except Exception as exc:
+            result = ConnectResult(1, str(exc) or "connection failed")
+        finally:
+            self.resume_after_ssh()
         if should_report_connect_error(result):
             self.message = format_connect_error(conn.host, result)
             self.draw()

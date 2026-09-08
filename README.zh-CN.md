@@ -2,7 +2,7 @@
 
 macOS 终端 SSH 启动器，支持 **Keychain 密码存储** 与 **会话操作日志**。单文件 `vnssh.py` 分发，依赖系统 Python 3 与 OpenSSH，无第三方包。
 
-当前版本：**1.0.1**（`vnssh --version`）。
+当前版本：**1.0.2**（`vnssh --version`）。
 
 [English](README.md)
 
@@ -25,7 +25,7 @@ cp vnssh.py ~/.local/bin/vnssh    # 可选：加入 PATH，命令名 vnssh
 1. 运行 `vnssh`（标题栏显示版本号）
 2. **Ctrl-N** 新建
 3. 填写 category、名称、地址、用户、认证（category / 名称支持中文）；密码可选，存入 Keychain
-4. 选中主机，**Enter** 连接
+4. 选中主机，**Enter** 连接。连接过程中 **Ctrl-C** 可取消并回到主机列表；网络错误、密码/认证失败也会回到列表，而不会把终端卡在 SSH 画面里。
 
 ### 命令行速查
 
@@ -68,6 +68,17 @@ vnssh 不实现私有 SSH 协议，连接与配置均遵循 OpenSSH 标准：
 - **可脱离 vnssh 使用**：删除 vnssh 后，只要保留 `hosts.conf` 与 `Include` 行，仍可直接 `ssh <Host名>`；密码类主机需自行处理输入方式（Keychain 集成由 vnssh 提供）。
 
 `~/.ssh/config` 中 vnssh 未托管的条目会在 TUI 显示并标记 **ext**。
+
+### 连接、取消与失败返回
+
+TUI 通过 PTY 启动 OpenSSH；一次尝试无论成功、失败还是取消，都应回到主机列表，而不是停在冻结的 SSH 画面。
+
+- **取消**：远端 shell 尚未起来时，**Ctrl-C** 结束本地 `ssh` 并返回 TUI。登录成功后，Ctrl-C 仍发给远端（与普通 SSH 一致）。
+- **二次提示**：Keychain/askpass 的第二次提示（OTP、重试等）下，**Ctrl-C** 或 **Esc** 视为取消，而不会把控制字符吃进密码行。
+- **硬失败**：连接超时、Connection refused、no route to host、网络不可达、Permission denied、Authentication failed，以及常见中文「密码错误」「认证失败」等，会结束本次尝试并在状态栏显示原因。
+- **看门狗**：若既无输出进展、也不是在等你输入（密码、OTP、主机密钥 yes/no），预登录阶段约 **20 秒** 后停止。TCP 握手仍使用 OpenSSH `ConnectTimeout` **5 秒**。正在等你打字时不计入这 20 秒。
+
+每次尝试开始时会打印 `Connecting... (Ctrl-C to cancel)`。
 
 ### 旧协议自动兼容
 
@@ -182,6 +193,7 @@ Category 注释可使用中文，例如 `#v-f:生产环境`。
 | PgUp / PgDn | 翻页 |
 | Ctrl-B / Ctrl-F | 翻页（与 PgUp / PgDn 相同） |
 | Esc | 清空搜索；搜索框为空时退出 |
+| Ctrl-C | 连接中（远端 shell 起来之前）：取消并回到列表 |
 
 列表标志：**p** = Keychain 有密码，**k** = 已配置密钥，**ext** = 外部 SSH 配置。
 
@@ -236,8 +248,15 @@ vnssh -V                      # 同上
 
 - TUI 要求终端至少 16 行 × 40 列（见 `MIN_TERMINAL_HEIGHT`）。放大窗口后重新运行。
 
+**连接卡住 / 无法回到 TUI**
+
+- 出现 `Connecting...`、远端 shell 尚未起来时按 **Ctrl-C**，会结束本地 `ssh` 并重绘列表。
+- 网络失败与认证错误应自动返回，原因显示在状态栏。
+- 若在等 OTP 或 `yes/no`，输入应答或 Ctrl-C 取消。登录成功后 Ctrl-C 发给远端进程，不再交给 vnssh。
+
 **认证失败 / Permission denied**
 
+- 应回到主机列表并在状态栏看到错误（而不是停在密码提示）。
 - 按 **e** 检查 `User`、`HostName`、端口与 `auth` 模式是否匹配。
 - 密钥认证：确认 `IdentityFile` 路径存在且权限为 `600` 左右。
 - 密码认证：在「钥匙串访问」中查看 `vnssh` 服务下对应 `Host` 账户；TUI 列表无 **p** 标记表示 Keychain 无条目。
