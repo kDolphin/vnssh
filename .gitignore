@@ -5,6 +5,7 @@ __pycache__/
 venv/
 *.session
 
-# Host import CSV (may contain passwords before Keychain import)
+# Host import/export CSV (import files may contain passwords)
 hosts.csv
+vnssh-hosts.csv
 vnssh-hosts-template.csv

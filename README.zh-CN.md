@@ -2,7 +2,7 @@
 
 macOS 终端 SSH 启动器，支持 **Keychain 密码存储** 与 **会话操作日志**。单文件 `vnssh.py` 分发，依赖系统 Python 3 与 OpenSSH，无第三方包。
 
-当前版本：**1.0.2**（`vnssh --version`）。
+当前版本：**1.0.5**（`vnssh --version`）。
 
 [English](README.md)
 
@@ -24,7 +24,7 @@ cp vnssh.py ~/.local/bin/vnssh    # 可选：加入 PATH，命令名 vnssh
 
 1. 运行 `vnssh`（标题栏显示版本号）
 2. **Ctrl-N** 新建
-3. 填写 category、名称、地址、用户、认证（category / 名称支持中文）；密码可选，存入 Keychain
+3. 填写 category、名称、地址、用户、认证（category / 名称支持中文）；密码可选，存入 Keychain。**Up** 回到上一栏；校验失败停在当前栏。堡垒机/OTP 主机把 **2FA / bastion** 填 `y`（写入 `#v-2fa`）。旧交换机把 **Legacy SSH algorithms** 填 `y`（写入 `#v-legacy`）。编辑时 **Password** 留空表示保留 Keychain 里的原密码，输入 `-` 删除。
 4. 选中主机，**Enter** 连接。连接过程中 **Ctrl-C** 可取消并回到主机列表；网络错误、密码/认证失败也会回到列表，而不会把终端卡在 SSH 画面里。
 
 ### 命令行速查
@@ -47,7 +47,7 @@ vnssh 以全屏 TUI 展示主机列表，支持实时过滤。搜索框输入任
 
 未输入搜索词时，列表按最近连接记录排序。
 
-新建 / 编辑向导（Ctrl-N / **e**）的输入框支持 **UTF-8**，**Category**、**Name** 等字段可直接输入中文及其他 CJK 字符。
+新建 / 编辑向导（Ctrl-N / **e**）的输入框支持 **UTF-8**，**Category**、**Name** 等字段可直接输入中文及其他 CJK 字符。**Enter** 下一栏，**Up** 上一栏，**Esc** 取消；填错只留在当前栏，不会整单作废。密码 / 密码+密钥主机有 **2FA / bastion**（`y`/`n`）一栏，用于写入或去掉 `#v-2fa`。托管主机另有 **Legacy SSH algorithms**（`y`/`n`）对应 `#v-legacy`。连接返回后（成功、失败或取消），列表仍停在刚才那台主机。
 
 ### Keychain 密码
 
@@ -71,7 +71,7 @@ vnssh 不实现私有 SSH 协议，连接与配置均遵循 OpenSSH 标准：
 
 ### 连接、取消与失败返回
 
-TUI 通过 PTY 启动 OpenSSH；一次尝试无论成功、失败还是取消，都应回到主机列表，而不是停在冻结的 SSH 画面。
+TUI 和 `vnssh connect <Host>` 都通过 PTY 启动 OpenSSH；一次尝试无论成功、失败还是取消，都应结束这次连接，而不是停在冻结的 SSH 画面。TUI 回到列表时仍选中刚才那台主机。
 
 - **取消**：远端 shell 尚未起来时，**Ctrl-C** 结束本地 `ssh` 并返回 TUI。登录成功后，Ctrl-C 仍发给远端（与普通 SSH 一致）。
 - **二次提示**：Keychain/askpass 的第二次提示（OTP、重试等）下，**Ctrl-C** 或 **Esc** 视为取消，而不会把控制字符吃进密码行。
@@ -89,10 +89,12 @@ TUI 通过 PTY 启动 OpenSSH；一次尝试无论成功、失败还是取消，
 - `no matching mac found`
 - `no matching host key type found`
 
+未标记的主机先用 OpenSSH 默认算法连接；只有协商失败才会改用旧算法重试。
+
 vnssh 提供两层处理：
 
-1. **自动学习**：首次连接失败且错误符合上述特征时，在对应 `Host` 块上方写入 `#v-legacy`，下次自动附加 `KexAlgorithms`、`HostKeyAlgorithms`、`Ciphers`、`MACs` 等兼容选项并写回 `hosts.conf`。
-2. **手工标记**：可预先添加 `#v-legacy`，跳过首次失败。
+1. **自动学习**：默认算法失败且错误符合上述特征时，当场用兼容的 `KexAlgorithms`、`HostKeyAlgorithms`、`Ciphers`、`MACs` 等重试，成功后在 `Host` 块上方写入 `#v-legacy`，下次直接走旧算法。
+2. **手工标记**：向导里把 **Legacy SSH algorithms** 设为 `y`，或在 `Host` 块上方手写 `#v-legacy`，跳过默认算法那一次。
 
 对 `#v-legacy` 且 `HostName` 为纯 IP 的主机，还会在 `hosts.conf` 生成以该 IP 为 `Host` 的别名块，使 `ssh user@<IP>` 与 `ssh <Host别名>` 使用相同旧协议选项。
 
@@ -114,15 +116,17 @@ vnssh 提供两层处理：
 
 示例：`VNSSH_SESSION_LOG=0 vnssh` 或 `VNSSH_SESSION_ARCHIVE=0 vnssh`。
 
-### CSV 导入
+### CSV 导入与导出
 
-适合批量录入或迁移主机清单：
+适合批量录入、备份或迁移主机清单：
 
 ```bash
 vnssh init                              # 生成 vnssh-hosts-template.csv（幂等）
 vnssh import hosts.csv                  # 导入
 vnssh import --dry-run hosts.csv        # 预览，不写配置
 vnssh import --force hosts.csv          # 覆盖 hosts.conf 中已有同名 Host
+vnssh export                            # 写出 vnssh-hosts.csv（不含密码）
+vnssh export backup.csv                 # 指定路径
 ```
 
 `vnssh init` 在 `hosts.conf` 与 `Include` 已就绪时跳过初始化；当前目录已有模板时不覆盖。
@@ -137,6 +141,8 @@ vnssh import --force hosts.csv          # 覆盖 hosts.conf 中已有同名 Host
 | `password` | 非空时写入 Keychain，不进入配置文件 |
 | `identity_file` | 私钥路径 |
 | `auth` | `password` / `key` / `both`（或 `1` / `2` / `3`） |
+| `twofa` | `y` / `n`（可选，写入 `#v-2fa`） |
+| `legacy` | `y` / `n`（可选，写入 `#v-legacy`） |
 
 导入规则：
 
@@ -147,6 +153,8 @@ vnssh import --force hosts.csv          # 覆盖 hosts.conf 中已有同名 Host
 | 已存在于 `~/.ssh/config`（ext） | 不修改其配置；CSV 含密码列时仅导入 Keychain |
 
 表头支持常见别名（如 `folder` → `category`）。建议先 `--dry-run` 核对统计。
+
+`vnssh export` 写出上述列，**不含 `password`**。用导出文件再 import 可恢复主机配置和 `#v-2fa` / `#v-legacy`，Keychain 密码不在文件里。
 
 ## 配置文件
 
@@ -159,14 +167,15 @@ vnssh 涉及的文件路径：
 | `~/Library/Keychains/` | Keychain 中的 `vnssh` 服务密码条目 |
 | `~/.vnssh/sessions/` | 会话日志（`.session`）与归档包（`.tar.gz`） |
 | `~/.vnssh/history.json` | 连接使用频率（用于排序） |
+| `~/.vnssh/.keychain-accounts.json` | Keychain **账户名**缓存（不含密码），避免每次启动都 dump 整个钥匙串 |
 
 `Host` 块**上方**可选注释（均为可选，按需添加）：
 
 | 注释 | 不写时的行为 | 写上时 |
 |------|----------------|--------|
 | `#v-f:分类名` | TUI Category 显示 **Uncategorized** | 显示指定分类，并参与搜索 |
-| `#v-2fa` | 有 Keychain 密码时走 `SSH_ASKPASS` 常规注入；无密码则依赖手工输入 | 交互连接时通过 PTY 检测提示并注入密码，OTP/验证码在终端手工输入 |
-| `#v-legacy` | 使用 OpenSSH 默认算法；若协商失败则自动学习并写入此标记 | 立即启用旧协议算法集，跳过首次失败 |
+| `#v-2fa` | 有 Keychain 密码时走 `SSH_ASKPASS` 常规注入；无密码则依赖手工输入 | 交互连接时通过 PTY 检测提示并注入密码，OTP/验证码在终端手工输入。向导里 **2FA / bastion** 填 `y` 即写入 |
+| `#v-legacy` | 使用 OpenSSH 默认算法；若协商失败则自动学习并写入此标记 | 立即启用旧协议算法集，跳过首次失败。向导里 **Legacy SSH algorithms** 填 `y` 即写入 |
 
 示例（三条注释可按需省略）：
 
@@ -195,7 +204,7 @@ Category 注释可使用中文，例如 `#v-f:生产环境`。
 | Esc | 清空搜索；搜索框为空时退出 |
 | Ctrl-C | 连接中（远端 shell 起来之前）：取消并回到列表 |
 
-列表标志：**p** = Keychain 有密码，**k** = 已配置密钥，**ext** = 外部 SSH 配置。
+列表标志：**p** = Keychain 有密码，**k** = 已配置密钥，**ext** = 外部 SSH 配置，**2** = 2FA/堡垒机（`#v-2fa`），**L** = 旧算法（`#v-legacy`）。
 
 ## 命令行
 
@@ -205,6 +214,8 @@ vnssh list
 vnssh connect <Host名>
 vnssh import hosts.csv
 vnssh import --dry-run file.csv
+vnssh export
+vnssh export backup.csv
 vnssh init
 vnssh version                 # 打印版本
 vnssh --version               # 同上
@@ -215,19 +226,21 @@ vnssh -V                      # 同上
 |------|------|
 | *(无参数)* | 启动全屏 TUI |
 | `list` | 非交互列出主机 |
-| `connect <Host>` | 连接指定主机 |
+| `connect <Host>` | 连接指定主机（与 TUI 同一套 PTY 中继：Ctrl-C、硬失败、20 秒看门狗） |
 | `import [选项] <file.csv>` | 批量导入；支持 `--dry-run`、`--force` |
+| `export [file.csv]` | 导出主机 CSV，无密码列（默认 `vnssh-hosts.csv`） |
 | `init` | 初始化环境并写出 CSV 模板 |
 | `version` / `--version` / `-V` | 打印 `vnssh <版本号>` 后退出 |
 
-日常浏览、搜索与连接建议直接使用 TUI；命令行适合脚本调用、批量导入、查看版本，或在无交互环境下快速连接单个 Host。
+日常浏览、搜索与连接建议直接使用 TUI；命令行适合脚本调用、批量导入/导出、查看版本，或快速连接单个 Host。
 
 ## 安全说明
 
 **Keychain 存储**
 
 - 密码以 Generic Password 形式存入登录钥匙串，`svce=vnssh`、`acct=<Host别名>`。
-- vnssh 通过 `/usr/bin/security` 读写，脚本本身与 `hosts.conf` 中均无明文密码字段。
+- vnssh 通过 `/usr/bin/security` 读写，脚本本身与 `hosts.conf` 中均无明文密码字段。编辑向导不会预填已存密码；留空表示保留，输入 `-` 删除。
+- `~/.vnssh/.keychain-accounts.json` 只缓存账户**名**（不含密码），避免每次启动 dump 整个钥匙串。
 - 其他用户或进程读取需通过 macOS 安全机制；首次访问时系统可能弹出授权对话框。
 - 删除某 Host 的 Keychain 条目：`security delete-generic-password -s vnssh -a <Host名>`（vnssh 编辑/删除主机时也会同步清理）。
 
@@ -259,19 +272,19 @@ vnssh -V                      # 同上
 - 应回到主机列表并在状态栏看到错误（而不是停在密码提示）。
 - 按 **e** 检查 `User`、`HostName`、端口与 `auth` 模式是否匹配。
 - 密钥认证：确认 `IdentityFile` 路径存在且权限为 `600` 左右。
-- 密码认证：在「钥匙串访问」中查看 `vnssh` 服务下对应 `Host` 账户；TUI 列表无 **p** 标记表示 Keychain 无条目。
+- 密码认证：在「钥匙串访问」中查看 `vnssh` 服务下对应 `Host` 账户；TUI 列表无 **p** 标记表示 Keychain 无条目。编辑时密码留空保留原值，输入 `-` 删除。
 - 手动验证：`security find-generic-password -s vnssh -a <Host名> -w`（会回显密码，仅在安全环境使用）。
 
 **2FA / 堡垒机异常**
 
-- 确认 `Host` 块上方有 `#v-2fa`，且 Keychain 中已为该 **Host 别名**（非 IP）保存密码。
+- 编辑该主机，把 **2FA / bastion** 设为 `y`，或在 `Host` 块上方手写 `#v-2fa`。Keychain 须已为该 **Host 别名**（非 IP）保存密码。
 - 无 `#v-2fa` 时不会启用 PTY 密码注入，复杂二次验证可能失败。
 - OTP 须在 vnssh 弹出的 SSH 终端内手工输入；日志在认证完成后才开始，OTP 不会写入 session 文件。
 
 **旧协议 / algorithm mismatch**
 
-- 首次报错 `no matching cipher` 等时，直接再连一次；vnssh 应自动写入 `#v-legacy`。
-- 若仍未成功，手工在 `Host` 上方添加 `#v-2fa` 同级的 `#v-legacy` 行后重试。
+- 未标记主机会先用 OpenSSH 默认算法；协商失败时当场用旧算法重试，并写入 `#v-legacy`。
+- 要跳过默认算法那一次，编辑主机把 **Legacy SSH algorithms** 设为 `y`，或在 `Host` 上方添加 `#v-legacy`。
 - 也可直接用 `ssh -v <Host名>` 对比 vnssh 附加的算法选项是否生效（`Include` 须能被 OpenSSH 读取）。
 
 **会话日志为空或 tail 看不到**
@@ -284,6 +297,7 @@ vnssh -V                      # 同上
 
 - `hosts.conf` 已有同名 Host 时默认跳过，需 `--force` 覆盖。
 - 来自 `~/.ssh/config` 的 ext 主机不会改写配置，仅在有 `password` 列时更新 Keychain。
+- `vnssh export` 不含密码；再 import 只恢复配置和 `twofa` / `legacy` 标记。
 
 ## 许可
 

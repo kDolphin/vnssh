@@ -2,7 +2,7 @@
 
 Terminal SSH launcher for macOS with **Keychain password storage** and **session operation logs**. Distributed as a single `vnssh.py` file; uses the system Python 3 and OpenSSH only—no third-party packages.
 
-Current version: **1.0.2** (`vnssh --version`).
+Current version: **1.0.5** (`vnssh --version`).
 
 [中文文档](README.zh-CN.md)
 
@@ -24,7 +24,7 @@ First run creates `~/.vnssh/`, `hosts.conf`, and the `Include` line in `~/.ssh/c
 
 1. Run `vnssh` (title bar shows the version)
 2. Press **Ctrl-N** to create a host
-3. Enter category, name, address, user, and auth (Unicode/CJK is fine for category and name); optional password goes to Keychain
+3. Enter category, name, address, user, and auth (Unicode/CJK is fine for category and name); optional password goes to Keychain. Use **Up** to go back a field; a validation error stays on that field. For a bastion/OTP host, set **2FA / bastion** to `y` (writes `#v-2fa`). For old network gear, set **Legacy SSH algorithms** to `y` (writes `#v-legacy`). When editing, leave **Password** empty to keep the current Keychain secret; type `-` to delete it.
 4. Select the host and press **Enter** to connect. While connecting, **Ctrl-C** cancels and returns to the host list. Network errors and authentication failures also return to the list instead of leaving the terminal stuck.
 
 ### CLI cheat sheet
@@ -47,7 +47,7 @@ Search spans **Category**, **Host alias**, **HostName**, **User**, **Port**, and
 
 With an empty search box, hosts are sorted by recent connections.
 
-New/edit wizards (Ctrl-N / **e**) accept **UTF-8 input**, including Chinese and other CJK text, in fields such as **Category** and **Name**.
+New/edit wizards (Ctrl-N / **e**) accept **UTF-8 input**, including Chinese and other CJK text, in fields such as **Category** and **Name**. **Enter** advances, **Up** returns to the previous field, **Esc** cancels; invalid input is shown on the same field instead of aborting the whole form. Password and both-auth hosts include a **2FA / bastion** (`y`/`n`) field that writes or removes `#v-2fa`. Every managed host also has **Legacy SSH algorithms** (`y`/`n`) for `#v-legacy`. After a connect returns (success, error, or cancel), the TUI keeps that host selected.
 
 ### Keychain passwords
 
@@ -71,7 +71,7 @@ Entries in `~/.ssh/config` that vnssh does not manage appear in the TUI marked *
 
 ### Connect, cancel, and errors
 
-TUI connects run OpenSSH on a PTY and always try to return to the host list when the attempt ends—success, failure, or cancel—rather than leaving a frozen SSH screen.
+TUI and `vnssh connect <Host>` run OpenSSH on a PTY and always try to return when the attempt ends—success, failure, or cancel—rather than leaving a frozen SSH screen. The TUI then restores the list with that host still selected.
 
 - **Cancel**: before a remote shell is up, **Ctrl-C** stops the local `ssh` process and returns to the TUI. After login, Ctrl-C is forwarded to the remote session as usual.
 - **Auth / extra prompts**: on a second Keychain/askpass prompt (OTP, retry, etc.), **Ctrl-C** or **Esc** cancels instead of sitting in a line buffer.
@@ -89,10 +89,12 @@ Some older switches and appliances only offer weaker algorithms (`ssh-rsa`, `dif
 - `no matching mac found`
 - `no matching host key type found`
 
+Untagged hosts connect with OpenSSH defaults first. Only a negotiation mismatch retries with the legacy algorithm set.
+
 vnssh handles this in two ways:
 
-1. **Auto-learn**: on first failure with matching stderr, vnssh adds `#v-legacy` above the `Host` block and, on the next attempt, applies compatible `KexAlgorithms`, `HostKeyAlgorithms`, `Ciphers`, `MACs`, etc., persisted in `hosts.conf`.
-2. **Manual tag**: add `#v-legacy` up front to skip the initial failure.
+1. **Auto-learn**: if the default attempt fails with matching stderr, vnssh retries immediately with compatible `KexAlgorithms`, `HostKeyAlgorithms`, `Ciphers`, `MACs`, etc., then writes `#v-legacy` above the `Host` block for next time.
+2. **Manual tag**: in the wizard set **Legacy SSH algorithms** to `y`, or add `#v-legacy` above the `Host` block, to skip the default attempt.
 
 For `#v-legacy` hosts whose `HostName` is a plain IP, vnssh also adds a `Host <IP>` alias stanza in `hosts.conf` so `ssh user@<IP>` picks up the same legacy options as `ssh <Host-alias>`.
 
@@ -114,15 +116,17 @@ Environment toggles (see `session_logging_enabled()` / `session_archive_enabled(
 
 Examples: `VNSSH_SESSION_LOG=0 vnssh` or `VNSSH_SESSION_ARCHIVE=0 vnssh`.
 
-### CSV import
+### CSV import and export
 
-For bulk onboarding or migration:
+For bulk onboarding, backup, or migration:
 
 ```bash
 vnssh init                              # write vnssh-hosts-template.csv (idempotent)
 vnssh import hosts.csv                  # import
 vnssh import --dry-run hosts.csv        # preview only
 vnssh import --force hosts.csv          # overwrite existing managed Host entries
+vnssh export                            # write vnssh-hosts.csv (no passwords)
+vnssh export backup.csv                 # choose a path
 ```
 
 `vnssh init` skips setup when `hosts.conf` and the `Include` line already exist; it does not overwrite an existing template in the current directory.
@@ -137,6 +141,8 @@ vnssh import --force hosts.csv          # overwrite existing managed Host entrie
 | `password` | If non-empty, stored in Keychain—not in config files |
 | `identity_file` | Private key path |
 | `auth` | `password`, `key`, or `both` (also `1`, `2`, `3`) |
+| `twofa` | `y` / `n` (optional; writes `#v-2fa`) |
+| `legacy` | `y` / `n` (optional; writes `#v-legacy`) |
 
 Import rules:
 
@@ -147,6 +153,8 @@ Import rules:
 | Already in `~/.ssh/config` (ext) | Config unchanged; password column updates Keychain only |
 
 Common header aliases are accepted (e.g. `folder` → `category`). Run `--dry-run` first to verify the action summary.
+
+`vnssh export` writes the same columns **except `password`**. Re-importing an export file restores host config and `#v-2fa` / `#v-legacy`; Keychain secrets are not in the file.
 
 ## Configuration
 
@@ -159,14 +167,15 @@ Paths vnssh uses:
 | `~/Library/Keychains/` | Keychain items for service `vnssh` |
 | `~/.vnssh/sessions/` | Session logs (`.session`) and archives (`.tar.gz`) |
 | `~/.vnssh/history.json` | Connection frequency (for sort order) |
+| `~/.vnssh/.keychain-accounts.json` | Cache of Keychain *account names* (not passwords) so the TUI can start without dumping the whole keychain |
 
 Optional comment lines **above** a `Host` block (all optional):
 
 | Comment | If omitted | If present |
 |---------|------------|------------|
 | `#v-f:Name` | TUI Category shows **Uncategorized** | Shows the given category; included in search |
-| `#v-2fa` | With a Keychain password, uses normal `SSH_ASKPASS` injection; otherwise manual entry | Interactive connects use PTY prompt detection for password inject; OTP typed in the SSH terminal |
-| `#v-legacy` | OpenSSH default algorithms; auto-learned on negotiation failure | Legacy algorithm set applied immediately |
+| `#v-2fa` | With a Keychain password, uses normal `SSH_ASKPASS` injection; otherwise manual entry | Interactive connects use PTY prompt detection for password inject; OTP typed in the SSH terminal. Set from the wizard **2FA / bastion** field (`y`) |
+| `#v-legacy` | OpenSSH default algorithms; auto-learned on negotiation failure | Legacy algorithm set applied immediately. Set from the wizard **Legacy SSH algorithms** field (`y`) |
 
 Example (any of the three comments may be omitted):
 
@@ -195,7 +204,7 @@ Category comments may use CJK, for example `#v-f:生产环境`.
 | Esc | Clear search; quit when search is empty |
 | Ctrl-C | While connecting (before a remote shell): cancel and return to the list |
 
-Badges: **p** = password in Keychain, **k** = SSH key configured, **ext** = external SSH config.
+Badges: **p** = password in Keychain, **k** = SSH key configured, **ext** = external SSH config, **2** = 2FA/bastion (`#v-2fa`), **L** = legacy algorithms (`#v-legacy`).
 
 ## CLI
 
@@ -205,6 +214,8 @@ vnssh list
 vnssh connect <Host>
 vnssh import hosts.csv
 vnssh import --dry-run file.csv
+vnssh export
+vnssh export backup.csv
 vnssh init
 vnssh version                 # print version
 vnssh --version               # same
@@ -215,19 +226,21 @@ vnssh -V                      # same
 |---------|-------------|
 | *(no args)* | Launch the full-screen TUI |
 | `list` | Print hosts (non-interactive) |
-| `connect <Host>` | Connect to one host |
+| `connect <Host>` | Connect to one host (same PTY relay as the TUI: Ctrl-C, hard-fail, 20s watchdog) |
 | `import [options] <file.csv>` | Bulk import; supports `--dry-run` and `--force` |
+| `export [file.csv]` | Write hosts to CSV with no password column (default `vnssh-hosts.csv`) |
 | `init` | Ensure setup and write the CSV template |
 | `version` / `--version` / `-V` | Print `vnssh <version>` and exit |
 
-For day-to-day browsing, search, and connect, the TUI is usually easier. The CLI is better for scripts, bulk import, version checks, or a quick non-interactive connect to one host.
+For day-to-day browsing, search, and connect, the TUI is usually easier. The CLI is better for scripts, bulk import/export, version checks, or a quick connect to one host.
 
 ## Security
 
 **Keychain**
 
 - Passwords are Generic Password items in the login keychain: `svce=vnssh`, `acct=<Host-alias>`.
-- vnssh accesses them only through `/usr/bin/security`; neither the script nor `hosts.conf` contains plaintext password fields.
+- vnssh accesses them only through `/usr/bin/security`; neither the script nor `hosts.conf` contains plaintext password fields. The TUI editor never prefills a stored password; leave the field empty to keep it, or type `-` to delete it.
+- Account *names* (not secrets) may be cached in `~/.vnssh/.keychain-accounts.json` so startup can skip a full keychain dump.
 - Other users or processes must pass macOS security policy; first access may show an authorization dialog.
 - Delete one host’s entry manually: `security delete-generic-password -s vnssh -a <Host>` (vnssh also removes entries when you edit or delete a host).
 
@@ -259,19 +272,19 @@ For day-to-day browsing, search, and connect, the TUI is usually easier. The CLI
 - You should land back on the host list with a status-bar error (not a stuck password prompt).
 - Press **e** and verify `User`, `HostName`, port, and `auth` mode.
 - Key auth: confirm `IdentityFile` exists and key permissions are tight (typically mode `600`).
-- Password auth: check Keychain Access for service `vnssh` and the matching `Host` account; no **p** badge means no Keychain entry.
+- Password auth: check Keychain Access for service `vnssh` and the matching `Host` account; no **p** badge means no Keychain entry. Editing a host: empty password keeps the current secret; `-` deletes it.
 - Manual check (prints the password—safe environments only): `security find-generic-password -s vnssh -a <Host> -w`.
 
 **2FA / bastion issues**
 
-- Ensure `#v-2fa` is above the `Host` block and Keychain has a password for the **Host alias** (not the IP).
+- Edit the host and set **2FA / bastion** to `y`, or put `#v-2fa` above the `Host` block. Keychain must have a password for the **Host alias** (not the IP).
 - Without `#v-2fa`, PTY password injection is not used; multi-step verification may fail.
 - Enter OTP in the SSH terminal vnssh opens; logging starts only after auth, so OTP is not written to session files.
 
 **Legacy protocol / algorithm mismatch**
 
-- On first `no matching cipher` (or similar) error, connect again; vnssh should persist `#v-legacy`.
-- If it still fails, add `#v-legacy` manually above the `Host` line.
+- Untagged hosts try OpenSSH defaults first; a negotiation mismatch retries with legacy algorithms and then writes `#v-legacy`.
+- To skip the default attempt, edit the host and set **Legacy SSH algorithms** to `y`, or add `#v-legacy` above the `Host` line.
 - Compare with `ssh -v <Host>` to confirm legacy options apply (`Include` must be readable by OpenSSH).
 
 **Empty session log / `tail -f` shows nothing**
@@ -284,6 +297,7 @@ For day-to-day browsing, search, and connect, the TUI is usually easier. The CLI
 
 - Existing managed hosts are skipped unless you pass `--force`.
 - External (`ext`) hosts are never rewritten in config; a `password` column updates Keychain only.
+- `vnssh export` omits passwords; re-import restores config and `twofa` / `legacy` flags only.
 
 ## License
 

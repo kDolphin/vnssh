@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""vnssh - macOS SSH launcher with search, favorites, and Keychain passwords."""
+"""vnssh - macOS SSH launcher with search and Keychain passwords."""
 
 from __future__ import annotations
 
@@ -32,13 +32,14 @@ from typing import Dict, List, Optional, Tuple
 # Paths & constants
 # ---------------------------------------------------------------------------
 
-__version__ = "1.0.2"
+__version__ = "1.0.5"
 
 VNSSH_DIR = Path.home() / ".vnssh"
 VNSSH_TERMINAL_TITLE = f"vnssh {__version__}"
 SESSIONS_DIR = VNSSH_DIR / "sessions"
 HOSTS_CONF = VNSSH_DIR / "hosts.conf"
 HISTORY_FILE = VNSSH_DIR / "history.json"
+KEYCHAIN_CACHE_FILE = VNSSH_DIR / ".keychain-accounts.json"
 SSH_CONFIG = Path.home() / ".ssh" / "config"
 KEYCHAIN_SERVICE = "vnssh"
 INCLUDE_MARKER = "Include ~/.vnssh/hosts.conf"
@@ -84,7 +85,7 @@ COL_HOST_MIN = 16
 COL_HOST_MAX = 32
 COL_ADDR_MIN = 12
 COL_ADDR_MAX = 48
-COL_FLAGS_W = 9
+COL_FLAGS_W = 15
 COL_PREFIX_W = 2
 TABLE_MAX_WIDTH = 120
 TABLE_GAPS = 3
@@ -134,6 +135,8 @@ IMPORT_COLUMNS = {
         "private_key",
     ),
     "auth": ("auth", "authentication"),
+    "twofa": ("twofa", "2fa", "otp", "bastion"),
+    "legacy": ("legacy",),
 }
 
 IMPORT_TEMPLATE_FIELDNAMES = (
@@ -145,7 +148,23 @@ IMPORT_TEMPLATE_FIELDNAMES = (
     "password",
     "identity_file",
     "auth",
+    "twofa",
+    "legacy",
 )
+
+EXPORT_DEFAULT_FILENAME = "vnssh-hosts.csv"
+EXPORT_FIELDNAMES = (
+    "category",
+    "host",
+    "hostname",
+    "user",
+    "port",
+    "identity_file",
+    "auth",
+    "twofa",
+    "legacy",
+)
+PASSWORD_DELETE_TOKEN = "-"
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +184,8 @@ class Connection:
     has_password: bool = False
     folder: str = FOLDER_UNCATEGORIZED
     search_blob: str = ""
+    twofa: bool = False
+    legacy: bool = False
 
     @property
     def folder_display(self) -> str:
@@ -201,6 +222,9 @@ class WizardData:
     password: str = ""
     folder: str = ""
     original_host: str = ""
+    # None = leave existing #v-2fa / #v-legacy untouched (CSV import / rewrite).
+    twofa: Optional[bool] = None
+    legacy: Optional[bool] = None
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +295,43 @@ _KEYCHAIN_ACCOUNTS_CACHE: Optional[set[str]] = None
 def invalidate_keychain_cache() -> None:
     global _KEYCHAIN_ACCOUNTS_CACHE
     _KEYCHAIN_ACCOUNTS_CACHE = None
+    KEYCHAIN_CACHE_FILE.unlink(missing_ok=True)
+
+
+def keychain_db_mtime() -> float:
+    keychain_path = Path.home() / "Library/Keychains/login.keychain-db"
+    try:
+        return keychain_path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def read_keychain_account_cache() -> Optional[Tuple[float, set[str]]]:
+    if not KEYCHAIN_CACHE_FILE.exists():
+        return None
+    try:
+        payload = json.loads(KEYCHAIN_CACHE_FILE.read_text(encoding="utf-8"))
+        mtime = float(payload["mtime"])
+        accounts = {str(name) for name in payload["accounts"]}
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+    return mtime, accounts
+
+
+def write_keychain_account_cache(mtime: float, accounts: set[str]) -> None:
+    try:
+        VNSSH_DIR.mkdir(parents=True, exist_ok=True)
+        KEYCHAIN_CACHE_FILE.write_text(
+            json.dumps(
+                {"mtime": mtime, "accounts": sorted(accounts)},
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(KEYCHAIN_CACHE_FILE, 0o600)
+    except OSError:
+        pass
 
 
 def parse_keychain_acct(block: str) -> Optional[str]:
@@ -303,33 +364,50 @@ def _vnssh_genp_section(entry: str) -> Optional[str]:
     return genp
 
 
-def load_keychain_accounts() -> set[str]:
-    """Load all vnssh Keychain account names in one dump (fast)."""
-    global _KEYCHAIN_ACCOUNTS_CACHE
-    if _KEYCHAIN_ACCOUNTS_CACHE is not None:
-        return _KEYCHAIN_ACCOUNTS_CACHE
-
+def dump_keychain_accounts() -> set[str]:
+    """Read vnssh account names from the login keychain (slow)."""
     accounts: set[str] = set()
     keychain_path = Path.home() / "Library/Keychains/login.keychain-db"
-    if keychain_path.exists():
+    if not keychain_path.exists():
+        return accounts
+    try:
         proc = subprocess.run(
             ["security", "dump-keychain", str(keychain_path)],
             capture_output=True,
             text=True,
             timeout=30,
         )
-        if proc.returncode == 0:
-            # Split per keychain item. Splitting only on class:"genp" merges many
-            # unrelated entries and breaks non-ASCII account names stored as hex.
-            for entry in re.split(r"\nkeychain:", proc.stdout):
-                genp = _vnssh_genp_section(entry)
-                if genp is None:
-                    continue
-                account = parse_keychain_acct(genp)
-                if account:
-                    accounts.add(account)
+    except (OSError, subprocess.TimeoutExpired):
+        return accounts
+    if proc.returncode != 0:
+        return accounts
+    # Split per keychain item. Splitting only on class:"genp" merges many
+    # unrelated entries and breaks non-ASCII account names stored as hex.
+    for entry in re.split(r"\nkeychain:", proc.stdout):
+        genp = _vnssh_genp_section(entry)
+        if genp is None:
+            continue
+        account = parse_keychain_acct(genp)
+        if account:
+            accounts.add(account)
+    return accounts
 
+
+def load_keychain_accounts() -> set[str]:
+    """Load vnssh Keychain account names; reuse a mtime-keyed disk cache."""
+    global _KEYCHAIN_ACCOUNTS_CACHE
+    if _KEYCHAIN_ACCOUNTS_CACHE is not None:
+        return _KEYCHAIN_ACCOUNTS_CACHE
+
+    mtime = keychain_db_mtime()
+    cached = read_keychain_account_cache()
+    if cached is not None and cached[0] == mtime:
+        _KEYCHAIN_ACCOUNTS_CACHE = cached[1]
+        return _KEYCHAIN_ACCOUNTS_CACHE
+
+    accounts = dump_keychain_accounts()
     _KEYCHAIN_ACCOUNTS_CACHE = accounts
+    write_keychain_account_cache(mtime, accounts)
     return accounts
 
 
@@ -753,6 +831,8 @@ def load_connections() -> List[Connection]:
             managed=source.resolve() == managed_path,
             has_password=has_pw,
             folder=folder,
+            twofa=opts.get("_vnssh_2fa") == "1" or opts.get("_vnssh_bastion") == "1",
+            legacy=opts.get("_vnssh_legacy") == "1",
         )
         conn.search_blob = build_search_blob(conn)
         connections.append(conn)
@@ -840,6 +920,8 @@ def host_entry_to_wizard(host: str, opts: Dict[str, str], folder: str) -> Wizard
         folder=folder,
         auth=infer_auth({"identityfile": identity}, keychain_has(host)),
         identity_file=identity or DEFAULT_IDENTITY,
+        twofa=opts.get("_vnssh_2fa") == "1" or opts.get("_vnssh_bastion") == "1",
+        legacy=opts.get("_vnssh_legacy") == "1",
     )
 
 
@@ -853,11 +935,17 @@ def merged_opts_from_wizard(
     }
     if data.auth in (AUTH_KEY, AUTH_BOTH):
         opts["identityfile"] = data.identity_file.strip() or DEFAULT_IDENTITY
+    twofa = data.twofa
+    if twofa is None and prior:
+        twofa = prior.get("_vnssh_2fa") == "1" or prior.get("_vnssh_bastion") == "1"
+    if twofa and data.auth != AUTH_KEY:
+        opts["_vnssh_2fa"] = "1"
+    legacy = data.legacy
+    if legacy is None and prior:
+        legacy = prior.get("_vnssh_legacy") == "1"
+    if legacy:
+        opts["_vnssh_legacy"] = "1"
     if prior:
-        if prior.get("_vnssh_legacy") == "1":
-            opts["_vnssh_legacy"] = "1"
-        if prior.get("_vnssh_2fa") == "1" or prior.get("_vnssh_bastion") == "1":
-            opts["_vnssh_2fa"] = "1"
         for key, value in prior.items():
             if key.startswith("_") or not value or key in opts:
                 continue
@@ -958,6 +1046,8 @@ def upsert_host_block(data: WizardData) -> None:
         new_entries.append(new_entry)
 
     write_hosts_conf(dedupe_config_entries(new_entries))
+    if data.legacy:
+        ensure_legacy_ip_stanzas()
 
 
 # ---------------------------------------------------------------------------
@@ -1717,6 +1807,27 @@ def open_controlling_tty() -> Optional[int]:
         return os.open("/dev/tty", os.O_RDWR)
     except OSError:
         return None
+
+
+def write_tty_notice(message: str) -> None:
+    """Print a short status line on the real terminal during connect."""
+    if not message:
+        return
+    payload = f"\r\n{message}\r\n".encode("utf-8")
+    fd = open_controlling_tty()
+    if fd is None:
+        try:
+            sys.stderr.write(f"{message}\n")
+            sys.stderr.flush()
+        except OSError:
+            pass
+        return
+    try:
+        os.write(fd, payload)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def set_terminal_title(title: str) -> None:
@@ -2886,11 +2997,15 @@ def connect_host(
     if legacy:
         return _run_interactive_ssh(host, legacy=True, use_keychain=use_keychain)
 
+    result = _run_interactive_ssh(host, legacy=False, use_keychain=use_keychain)
+    if result.returncode == 130:
+        return result
+    if not ssh_algorithm_mismatch(result):
+        return result
+    write_tty_notice("Retrying with legacy SSH algorithms...")
     result = _run_interactive_ssh(host, legacy=True, use_keychain=use_keychain)
     if result.returncode == 130:
         return result
-    if ssh_algorithm_mismatch(result):
-        return _run_interactive_ssh(host, legacy=False, use_keychain=use_keychain)
     if legacy_session_viable(result):
         persist_legacy_host(host)
     return result
@@ -2902,6 +3017,27 @@ def apply_keychain_password(host: str, password: str) -> None:
         keychain_set(host, password)
     else:
         keychain_delete(host)
+
+
+def wizard_keychain_update(data: WizardData) -> Optional[str]:
+    """Return password to store, '' to delete, None to leave Keychain unchanged."""
+    if data.auth == AUTH_KEY:
+        return ""
+    if data.original_host:
+        if data.password == PASSWORD_DELETE_TOKEN:
+            return ""
+        if data.password:
+            return data.password
+        return None
+    return data.password
+
+
+def apply_wizard_keychain(data: WizardData) -> None:
+    """Apply wizard password to Keychain. Edit: empty keeps, '-' deletes."""
+    update = wizard_keychain_update(data)
+    if update is None:
+        return
+    apply_keychain_password(data.host, update)
 
 
 # ---------------------------------------------------------------------------
@@ -2966,7 +3102,19 @@ def format_conn_flags(conn: Connection) -> str:
         parts.append("p")
     if conn.identity_file:
         parts.append("k")
+    if conn.twofa:
+        parts.append("2")
+    if conn.legacy:
+        parts.append("L")
     return " ".join(parts) if parts else "-"
+
+
+def format_status_message(message: str, status: str, inner_width: int) -> Tuple[str, int]:
+    """Fit a CJK-aware status-bar message to the left of the range counter."""
+    status_w = str_display_width(status)
+    status_x = max(0, inner_width - status_w)
+    max_msg = max(0, status_x - 1)
+    return truncate_display(message, max_msg), status_x
 
 
 def distribute_column_widths(flex_space: int) -> Tuple[int, int, int]:
@@ -3186,8 +3334,11 @@ def read_line_input(
     width: int,
     initial: str = "",
     secret: bool = False,
-) -> Optional[str]:
-    """Single-line editor; accepts UTF-8 (including CJK) via getch_utf8."""
+) -> Tuple[str, str]:
+    """Single-line editor; accepts UTF-8 (including CJK) via getch_utf8.
+
+    Returns (action, value) where action is 'ok', 'back', or 'cancel'.
+    """
     curses.curs_set(1)
     value = list(initial)
     pos = len(value)
@@ -3224,9 +3375,11 @@ def read_line_input(
 
         char, ch = getch_utf8(stdscr)
         if ch in (10, 13, curses.KEY_ENTER):
-            return "".join(value)
+            return "ok", "".join(value)
         if ch in (27, 3):
-            return None
+            return "cancel", "".join(value)
+        if ch in (curses.KEY_UP,):
+            return "back", "".join(value)
         if ch in (8, 127, curses.KEY_BACKSPACE):
             if pos > 0:
                 value.pop(pos - 1)
@@ -3267,17 +3420,34 @@ WIZARD_FIELDS_FULL = [
     ("auth", "Auth [1=password 2=key 3=both]: ", False),
     ("identity_file", "Key path: ", False),
     ("password", "Password (optional): ", True),
+    ("twofa", "2FA / bastion [y/N]: ", False),
+    ("legacy", "Legacy SSH algorithms [y/N]: ", False),
 ]
 
 WIZARD_FIELDS_PASSWORD_ONLY = [
-    ("password", "Password (empty=delete): ", True),
+    ("password", "Password (empty=keep, -=delete): ", True),
 ]
+
+WIZARD_NAV_HINT = "Enter next   Up back   Esc cancel"
+
+
+def parse_yes_no(value: str, default: bool = False) -> Optional[bool]:
+    token = value.strip().lower()
+    if not token:
+        return default
+    if token in ("y", "yes", "1", "true", "on"):
+        return True
+    if token in ("n", "no", "0", "false", "off"):
+        return False
+    return None
 
 
 def wizard_field_visible(key: str, data: WizardData) -> bool:
     if key == "identity_file" and data.auth == AUTH_PASSWORD:
         return False
     if key == "password" and data.auth == AUTH_KEY:
+        return False
+    if key == "twofa" and data.auth == AUTH_KEY:
         return False
     return True
 
@@ -3288,6 +3458,10 @@ def wizard_field_initial(key: str, data: WizardData) -> str:
     if key == "folder":
         folder = str(getattr(data, "folder", ""))
         return "" if is_uncategorized_folder(folder) else folder
+    if key == "twofa":
+        return "y" if data.twofa else "n"
+    if key == "legacy":
+        return "y" if data.legacy else "n"
     return str(getattr(data, key, ""))
 
 
@@ -3296,6 +3470,10 @@ def apply_wizard_field(key: str, data: WizardData, value: str) -> Optional[str]:
         value = value.strip()
         if not value:
             return "Name cannot be empty"
+        if value != data.original_host:
+            raw = gather_raw_hosts()
+            if value in raw:
+                return f"Host '{value}' already exists"
         data.host = value
     elif key == "folder":
         data.folder = value.strip()
@@ -3304,18 +3482,50 @@ def apply_wizard_field(key: str, data: WizardData, value: str) -> Optional[str]:
         if not data.hostname:
             return "Address cannot be empty"
     elif key == "port":
-        data.port = value.strip() or str(DEFAULT_PORT)
+        raw_port = value.strip() or str(DEFAULT_PORT)
+        try:
+            port = int(raw_port)
+        except ValueError:
+            return "Port must be a number"
+        if port < 1 or port > 65535:
+            return "Port must be 1-65535"
+        data.port = str(port)
     elif key == "user":
         data.user = value.strip()
     elif key == "auth":
-        data.auth = {"1": AUTH_PASSWORD, "2": AUTH_KEY, "3": AUTH_BOTH}.get(
-            value.strip() or "1", AUTH_PASSWORD
-        )
+        token = value.strip() or "1"
+        mapped = {"1": AUTH_PASSWORD, "2": AUTH_KEY, "3": AUTH_BOTH}.get(token)
+        if mapped is None:
+            return "Enter 1=password, 2=key, or 3=both"
+        data.auth = mapped
+        if data.auth == AUTH_KEY:
+            data.twofa = False
     elif key == "identity_file":
         data.identity_file = value.strip() or DEFAULT_IDENTITY
     elif key == "password":
         data.password = value
+    elif key == "twofa":
+        parsed = parse_yes_no(value, default=False)
+        if parsed is None:
+            return "Enter y or n"
+        data.twofa = parsed
+    elif key == "legacy":
+        parsed = parse_yes_no(value, default=False)
+        if parsed is None:
+            return "Enter y or n"
+        data.legacy = parsed
     return None
+
+
+def wizard_prev_index(
+    fields: List[Tuple[str, str, bool]], data: WizardData, index: int
+) -> int:
+    cursor = index - 1
+    while cursor >= 0:
+        if wizard_field_visible(fields[cursor][0], data):
+            return cursor
+        cursor -= 1
+    return index
 
 
 def run_wizard(
@@ -3324,10 +3534,14 @@ def run_wizard(
     data: WizardData,
     fields: List[Tuple[str, str, bool]],
 ) -> Optional[WizardData]:
-    height, width = stdscr.getmaxyx()
+    _height, width = stdscr.getmaxyx()
+    index = 0
+    error = ""
 
-    for key, label, secret in fields:
+    while index < len(fields):
+        key, label, secret = fields[index]
         if not wizard_field_visible(key, data):
+            index += 1
             continue
 
         stdscr.clear()
@@ -3335,31 +3549,49 @@ def run_wizard(
         safe_addstr(stdscr, 2, 2, label, curses.A_BOLD)
         if key == "auth":
             safe_addstr(stdscr, 3, 4, "1=password  2=key  3=password+key", curses.A_DIM)
-        if key == "password" and data.auth != AUTH_KEY:
-            hint = "Saved to Keychain; empty removes stored password (enter at connect)"
+        elif key == "password" and data.auth != AUTH_KEY:
+            if data.original_host:
+                hint = "Empty keeps the current Keychain password; '-' deletes it"
+            else:
+                hint = "Saved to Keychain; empty = no stored password"
             safe_addstr(stdscr, 3, 4, hint, curses.A_DIM)
+        elif key == "twofa":
+            safe_addstr(
+                stdscr,
+                3,
+                4,
+                "y = password then OTP in the SSH terminal (writes #v-2fa)",
+                curses.A_DIM,
+            )
+        elif key == "legacy":
+            safe_addstr(
+                stdscr,
+                3,
+                4,
+                "y = old switches (ssh-rsa / 3des); writes #v-legacy",
+                curses.A_DIM,
+            )
+        if error:
+            safe_addstr(stdscr, 4, 4, error, curses.color_pair(4))
+        safe_addstr(stdscr, 7, 2, WIZARD_NAV_HINT, curses.A_DIM)
 
         initial = wizard_field_initial(key, data)
-        value = read_line_input(stdscr, 5, 4, width - 8, initial, secret=secret)
-        if value is None:
+        action, value = read_line_input(
+            stdscr, 5, 4, width - 8, initial, secret=secret
+        )
+        if action == "cancel":
             return None
+        if action == "back":
+            error = ""
+            index = wizard_prev_index(fields, data, index)
+            continue
 
-        error = apply_wizard_field(key, data, value)
-        if error:
-            safe_addstr(stdscr, 7, 4, error, curses.color_pair(4))
-            stdscr.refresh()
-            stdscr.getch()
-            return None
-
-    if not data.original_host:
-        raw = gather_raw_hosts()
-        if data.host in raw:
-            stdscr.clear()
-            draw_box_title(stdscr, title)
-            safe_addstr(stdscr, 3, 4, f"Host '{data.host}' already exists", curses.color_pair(4))
-            stdscr.refresh()
-            stdscr.getch()
-            return None
+        field_error = apply_wizard_field(key, data, value)
+        if field_error:
+            error = field_error
+            continue
+        error = ""
+        index += 1
 
     return data
 
@@ -3372,10 +3604,7 @@ def wizard_new(stdscr) -> Optional[WizardData]:
     if result is None:
         return None
     upsert_host_block(result)
-    if result.auth in (AUTH_PASSWORD, AUTH_BOTH):
-        apply_keychain_password(result.host, result.password)
-    else:
-        keychain_delete(result.host)
+    apply_wizard_keychain(result)
     return result
 
 
@@ -3391,17 +3620,16 @@ def wizard_edit(stdscr, conn: Connection) -> Optional[WizardData]:
             user=conn.user,
             auth=conn.auth,
             identity_file=conn.identity_file or DEFAULT_IDENTITY,
-            password=keychain_get(conn.host) or "",
+            password="",
             original_host=conn.host,
+            twofa=host_2fa_enabled(conn.host),
+            legacy=host_legacy_enabled(conn.host),
         )
         result = run_wizard(stdscr, "Edit", data, WIZARD_FIELDS_FULL)
         if result is None:
             return None
         upsert_host_block(result)
-        if result.auth in (AUTH_PASSWORD, AUTH_BOTH):
-            apply_keychain_password(result.host, result.password)
-        else:
-            keychain_delete(result.host)
+        apply_wizard_keychain(result)
         return result
 
     draw_box_title(stdscr, f"Edit {conn.host} [ext]")
@@ -3414,13 +3642,13 @@ def wizard_edit(stdscr, conn: Connection) -> Optional[WizardData]:
     )
     data = WizardData(
         host=conn.host,
-        password=keychain_get(conn.host) or "",
+        password="",
         original_host=conn.host,
     )
     result = run_wizard(stdscr, "Edit password", data, WIZARD_FIELDS_PASSWORD_ONLY)
     if result is None:
         return None
-    apply_keychain_password(result.host, result.password)
+    apply_wizard_keychain(result)
     return result
 
 
@@ -3515,9 +3743,9 @@ class MainUI:
             "page_size": page_size,
         }
 
-    def reload_connections(self) -> None:
+    def reload_connections(self, reset_scroll: bool = True) -> None:
         self.connections = load_connections()
-        self.apply_filter(reset_scroll=True)
+        self.apply_filter(reset_scroll=reset_scroll)
 
     def apply_filter(self, reset_scroll: bool = False) -> None:
         self.filtered = sorted_connections(self.connections, self.query)
@@ -3562,7 +3790,23 @@ class MainUI:
         self.focus = "list"
         self.clamp_scroll()
 
-    def resume_after_ssh(self) -> None:
+    def select_host(self, host: str) -> bool:
+        """Focus the list on host after reload; return False if it is gone."""
+        self.reload_connections(reset_scroll=False)
+        for idx, conn in enumerate(self.filtered):
+            if conn.host != host:
+                continue
+            page = max(1, self.layout()["page_size"])
+            if idx < self.scroll or idx >= self.scroll + page:
+                self.scroll = 0 if idx < page else idx - page + 1
+            self.list_cursor = idx - self.scroll
+            self.focus = "list"
+            self.clamp_scroll()
+            return True
+        self.focus_input()
+        return False
+
+    def resume_after_ssh(self, selected_host: str = "") -> None:
         clear_terminal_screen()
         set_terminal_title(VNSSH_TERMINAL_TITLE)
         try:
@@ -3572,8 +3816,11 @@ class MainUI:
             curses.set_escdelay(25)
             init_colors()
             self.stdscr.clear()
-            self.focus_input()
-            self.reload_connections()
+            if selected_host:
+                self.select_host(selected_host)
+            else:
+                self.focus_input()
+                self.reload_connections()
             self.draw()
         except curses.error:
             pass
@@ -3709,16 +3956,17 @@ class MainUI:
         cols = table_columns(width)
         status = self.status_text(layout)
         status_attr = curses.A_DIM
-        status_x = cols["margin"] + cols["inner"] - len(status)
+        message, status_offset = format_status_message(
+            self.message, status, cols["inner"]
+        )
+        status_x = cols["margin"] + status_offset
         safe_addstr(stdscr, row, status_x, status, status_attr)
-
-        if self.message:
-            max_left = max(0, status_x - cols["margin"] - 1)
+        if message:
             safe_addstr(
                 stdscr,
                 row,
                 cols["margin"],
-                self.message[:max_left],
+                message,
                 curses.color_pair(3),
             )
 
@@ -3812,7 +4060,7 @@ class MainUI:
         except Exception as exc:
             result = ConnectResult(1, str(exc) or "connection failed")
         finally:
-            self.resume_after_ssh()
+            self.resume_after_ssh(conn.host)
         if should_report_connect_error(result):
             self.message = format_connect_error(conn.host, result)
             self.draw()
@@ -3981,6 +4229,8 @@ def write_import_template(path: Path) -> bool:
             "password": "",
             "identity_file": "",
             "auth": "password",
+            "twofa": "n",
+            "legacy": "n",
         },
         {
             "category": "Development",
@@ -3991,6 +4241,8 @@ def write_import_template(path: Path) -> bool:
             "password": "",
             "identity_file": "~/.ssh/id_ed25519",
             "auth": "key",
+            "twofa": "n",
+            "legacy": "n",
         },
     ]
     with path.open("w", encoding="utf-8", newline="") as handle:
@@ -4023,7 +4275,59 @@ def cmd_list() -> None:
 
 def cmd_connect(host: str) -> None:
     ensure_include()
-    connect_host(host, exec_mode=True)
+    if host not in gather_raw_hosts():
+        print(f"Unknown host: {host}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        result = connect_host(host, exec_mode=False)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    if should_report_connect_error(result):
+        print(format_connect_error(host, result), file=sys.stderr)
+        sys.exit(result.returncode or 1)
+    sys.exit(result.returncode)
+
+
+def connection_to_export_row(conn: Connection) -> Dict[str, str]:
+    identity = conn.identity_file or ""
+    if conn.auth == AUTH_PASSWORD:
+        identity = ""
+    return {
+        "category": "" if is_uncategorized_folder(conn.folder) else conn.folder_display,
+        "host": conn.host,
+        "hostname": conn.hostname,
+        "user": conn.user,
+        "port": "" if conn.port == DEFAULT_PORT else str(conn.port),
+        "identity_file": identity,
+        "auth": conn.auth,
+        "twofa": "y" if conn.twofa else "n",
+        "legacy": "y" if conn.legacy else "n",
+    }
+
+
+def write_export_csv(path: Path, connections: List[Connection]) -> int:
+    rows = [connection_to_export_row(conn) for conn in connections]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=EXPORT_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+    return len(rows)
+
+
+def cmd_export(argv: List[str]) -> None:
+    if len(argv) > 1:
+        print("Usage: vnssh export [file.csv]")
+        sys.exit(1)
+    path = (
+        Path(argv[0]).expanduser()
+        if argv
+        else Path.cwd() / EXPORT_DEFAULT_FILENAME
+    )
+    ensure_include()
+    connections = sorted_connections(load_connections(), "")
+    count = write_export_csv(path, connections)
+    print(f"Exported {count} host(s) to {path} (no passwords)")
 
 
 # ---------------------------------------------------------------------------
@@ -4081,6 +4385,11 @@ def row_to_wizard(row: Dict[str, str]) -> WizardData:
     identity_file = row.get("identity_file", "").strip()
     auth = parse_import_auth(row.get("auth", ""), identity_file, password)
 
+    twofa_raw = row.get("twofa", "")
+    legacy_raw = row.get("legacy", "")
+    twofa = parse_yes_no(twofa_raw, default=False) if twofa_raw.strip() else None
+    legacy = parse_yes_no(legacy_raw, default=False) if legacy_raw.strip() else None
+
     return WizardData(
         host=host,
         folder=row.get("category", "").strip(),
@@ -4090,6 +4399,8 @@ def row_to_wizard(row: Dict[str, str]) -> WizardData:
         auth=auth,
         identity_file=identity_file or DEFAULT_IDENTITY,
         password=password,
+        twofa=twofa,
+        legacy=legacy,
     )
 
 
@@ -4212,7 +4523,7 @@ def cmd_import(argv: List[str]) -> None:
             "Usage: vnssh import [--dry-run] [--force] <file.csv>\n"
             "\n"
             "CSV headers:\n"
-            "  category, host, hostname, user, port, password, identity_file, auth\n"
+            "  category, host, hostname, user, port, password, identity_file, auth, twofa, legacy\n"
             "\n"
             f"Run `vnssh init` to create {IMPORT_TEMPLATE_FILENAME} in the current directory.\n"
             "\n"
@@ -4292,7 +4603,8 @@ def cmd_version() -> None:
 def print_usage() -> None:
     print(
         "Usage: vnssh | vnssh init | vnssh list | vnssh connect <Host> | "
-        "vnssh import [--dry-run] [--force] <file.csv> | vnssh version\n"
+        "vnssh import [--dry-run] [--force] <file.csv> | "
+        "vnssh export [file.csv] | vnssh version\n"
         "       vnssh --version | -V"
     )
 
@@ -4317,6 +4629,9 @@ def main() -> None:
             return
         if cmd == "import":
             cmd_import(sys.argv[2:])
+            return
+        if cmd == "export":
+            cmd_export(sys.argv[2:])
             return
         print_usage()
         sys.exit(1)
