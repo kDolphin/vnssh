@@ -111,6 +111,29 @@ class ConfigFlagWriteTests(unittest.TestCase):
         self.assertLess(block.index("#v-2fa"), block.index("#v-legacy"))
 
 
+class PrivateKeyPermissionTests(unittest.TestCase):
+    def test_ensure_private_key_permissions_tightens_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            key = Path(tmp) / "id_test.pem"
+            key.write_text("dummy-key\n", encoding="utf-8")
+            key.chmod(0o644)
+            self.assertIsNone(vnssh.ensure_private_key_permissions(str(key)))
+            self.assertEqual(key.stat().st_mode & 0o777, 0o600)
+
+    def test_ensure_private_key_permissions_keeps_owner_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            key = Path(tmp) / "id_ok.pem"
+            key.write_text("dummy-key\n", encoding="utf-8")
+            key.chmod(0o600)
+            self.assertIsNone(vnssh.ensure_private_key_permissions(str(key)))
+            self.assertEqual(key.stat().st_mode & 0o777, 0o600)
+
+    def test_ensure_private_key_permissions_missing_path(self) -> None:
+        err = vnssh.ensure_private_key_permissions("/no/such/key.pem")
+        self.assertIsNotNone(err)
+        self.assertIn("not accessible", err or "")
+
+
 class CsvRoundTripTests(unittest.TestCase):
     def test_row_to_wizard_flags(self) -> None:
         data = vnssh.row_to_wizard(

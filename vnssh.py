@@ -17,6 +17,7 @@ import select
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import termios
@@ -32,7 +33,7 @@ from typing import Dict, List, Optional, Tuple
 # Paths & constants
 # ---------------------------------------------------------------------------
 
-__version__ = "1.0.5"
+__version__ = "1.0.6"
 
 VNSSH_DIR = Path.home() / ".vnssh"
 VNSSH_TERMINAL_TITLE = f"vnssh {__version__}"
@@ -783,6 +784,42 @@ def configured_identity_file(host: str, opts: Dict[str, str]) -> str:
     return ""
 
 
+def host_identity_file(host: str) -> str:
+    """Return IdentityFile from managed/parsed host config, if any."""
+    entry = gather_raw_hosts().get(host)
+    if not entry:
+        return ""
+    return (entry[0].get("identityfile") or "").strip()
+
+
+def ensure_private_key_permissions(path: str) -> Optional[str]:
+    """Tighten a private key to mode 0600 when group/other bits are set.
+
+    OpenSSH ignores keys that are group/world-accessible. Cloud sync folders
+    (Dropbox, etc.) often reset mode to 0644 after a Mac restart; call this
+    immediately before ssh so each connect sees a usable key.
+
+    Returns None when OK or nothing to do; otherwise an error message.
+    """
+    if not path or not path.strip():
+        return None
+    expanded = os.path.expanduser(path.strip())
+    try:
+        mode = stat.S_IMODE(os.stat(expanded).st_mode)
+    except OSError as exc:
+        return f"private key not accessible ({expanded}): {exc}"
+    if mode & 0o077 == 0:
+        return None
+    try:
+        os.chmod(expanded, 0o600)
+    except OSError as exc:
+        return (
+            f"private key permissions too open ({mode:04o}) for {expanded}; "
+            f"chmod 600 failed: {exc}"
+        )
+    return None
+
+
 def connection_auth_mode(host: str) -> str:
     """Resolve auth mode for connect-time SSH args (may run ssh -G when needed)."""
     entry = gather_raw_hosts().get(host)
@@ -1504,6 +1541,7 @@ def resolve_ssh_endpoint(host: str) -> Tuple[str, List[str]]:
     identity = opts.get("identityfile")
     if identity:
         extra.extend(["-i", os.path.expanduser(identity)])
+        extra.extend(["-o", "IdentitiesOnly=yes"])
 
     if is_valid_ssh_host_argument(host):
         return host, extra
@@ -1774,6 +1812,18 @@ def build_ssh_argv(host: str, *, legacy: Optional[bool] = None) -> List[str]:
                 "PreferredAuthentications=keyboard-interactive,password",
                 "-o",
                 "PubkeyAuthentication=no",
+            ]
+        )
+    elif mode == AUTH_KEY:
+        # Avoid password-prompt noise when the key is missing/unreadable.
+        args.extend(
+            [
+                "-o",
+                "PreferredAuthentications=publickey",
+                "-o",
+                "PasswordAuthentication=no",
+                "-o",
+                "KbdInteractiveAuthentication=no",
             ]
         )
     if use_legacy:
@@ -2890,6 +2940,10 @@ def run_ssh_with_tty(
 def prepare_ssh_invocation(
     host: str, *, legacy: bool, use_keychain: bool, interactive: bool = True
 ) -> Tuple[List[str], Dict[str, str], bool, bool]:
+    # Dropbox/iCloud often reset key mode to 0644 after restart; fix before ssh.
+    identity = host_identity_file(host)
+    if identity:
+        ensure_private_key_permissions(identity)
     ssh_args = build_ssh_argv(host, legacy=legacy)
     env = os.environ.copy()
     use_askpass, use_pty_inject = (
@@ -3038,6 +3092,13 @@ def apply_wizard_keychain(data: WizardData) -> None:
     if update is None:
         return
     apply_keychain_password(data.host, update)
+
+
+def apply_wizard_identity_permissions(data: WizardData) -> None:
+    """Best-effort chmod 600 on the configured private key after save."""
+    if data.auth not in (AUTH_KEY, AUTH_BOTH):
+        return
+    ensure_private_key_permissions(data.identity_file)
 
 
 # ---------------------------------------------------------------------------
@@ -3605,6 +3666,7 @@ def wizard_new(stdscr) -> Optional[WizardData]:
         return None
     upsert_host_block(result)
     apply_wizard_keychain(result)
+    apply_wizard_identity_permissions(result)
     return result
 
 
@@ -3630,6 +3692,7 @@ def wizard_edit(stdscr, conn: Connection) -> Optional[WizardData]:
             return None
         upsert_host_block(result)
         apply_wizard_keychain(result)
+        apply_wizard_identity_permissions(result)
         return result
 
     draw_box_title(stdscr, f"Edit {conn.host} [ext]")
@@ -4440,6 +4503,7 @@ def import_wizard_data(data: WizardData, force: bool = False, dry_run: bool = Fa
             apply_keychain_password(data.host, data.password)
         else:
             keychain_delete(data.host)
+        apply_wizard_identity_permissions(data)
         return action
 
     if action == "keychain_ext":
@@ -4451,6 +4515,7 @@ def import_wizard_data(data: WizardData, force: bool = False, dry_run: bool = Fa
         apply_keychain_password(data.host, data.password)
     else:
         keychain_delete(data.host)
+    apply_wizard_identity_permissions(data)
     return "add"
 
 

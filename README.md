@@ -2,7 +2,7 @@
 
 Terminal SSH launcher for macOS with **Keychain password storage** and **session operation logs**. Distributed as a single `vnssh.py` file; uses the system Python 3 and OpenSSH only—no third-party packages.
 
-Current version: **1.0.5** (`vnssh --version`).
+Current version: **1.0.6** (`vnssh --version`).
 
 [中文文档](README.zh-CN.md)
 
@@ -271,7 +271,7 @@ For day-to-day browsing, search, and connect, the TUI is usually easier. The CLI
 
 - You should land back on the host list with a status-bar error (not a stuck password prompt).
 - Press **e** and verify `User`, `HostName`, port, and `auth` mode.
-- Key auth: confirm `IdentityFile` exists and key permissions are tight (typically mode `600`).
+- Key auth: confirm `IdentityFile` exists. OpenSSH requires private-key mode `600`; keys in Dropbox/iCloud are often reset to `644` after a Mac restart, which yields `Permission denied`. vnssh runs `chmod 600` before connect; you can also `chmod 600 <key>` or keep keys under `~/.ssh/`.
 - Password auth: check Keychain Access for service `vnssh` and the matching `Host` account; no **p** badge means no Keychain entry. Editing a host: empty password keeps the current secret; `-` deletes it.
 - Manual check (prints the password—safe environments only): `security find-generic-password -s vnssh -a <Host> -w`.
 

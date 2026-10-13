@@ -2,7 +2,7 @@
 
 macOS 终端 SSH 启动器，支持 **Keychain 密码存储** 与 **会话操作日志**。单文件 `vnssh.py` 分发，依赖系统 Python 3 与 OpenSSH，无第三方包。
 
-当前版本：**1.0.5**（`vnssh --version`）。
+当前版本：**1.0.6**（`vnssh --version`）。
 
 [English](README.md)
 
@@ -271,7 +271,7 @@ vnssh -V                      # 同上
 
 - 应回到主机列表并在状态栏看到错误（而不是停在密码提示）。
 - 按 **e** 检查 `User`、`HostName`、端口与 `auth` 模式是否匹配。
-- 密钥认证：确认 `IdentityFile` 路径存在且权限为 `600` 左右。
+- 密钥认证：确认 `IdentityFile` 路径存在。OpenSSH 要求私钥权限为 `600`；放在 Dropbox/iCloud 等同步目录时，重启后常被改回 `644` 导致 `Permission denied`。vnssh 会在连接前自动 `chmod 600`；也可手动执行 `chmod 600 <私钥路径>`，或把密钥拷到 `~/.ssh/`。
 - 密码认证：在「钥匙串访问」中查看 `vnssh` 服务下对应 `Host` 账户；TUI 列表无 **p** 标记表示 Keychain 无条目。编辑时密码留空保留原值，输入 `-` 删除。
 - 手动验证：`security find-generic-password -s vnssh -a <Host名> -w`（会回显密码，仅在安全环境使用）。
 
