@@ -2,7 +2,7 @@
 
 Terminal SSH launcher for macOS with **Keychain password storage** and **session operation logs**. Distributed as a single `vnssh.py` file; uses the system Python 3 and OpenSSH only—no third-party packages.
 
-Current version: **1.0.6** (`vnssh --version`).
+Current version: **1.0.7** (`vnssh --version`).
 
 [中文文档](README.zh-CN.md)
 
@@ -148,13 +148,13 @@ Import rules:
 
 | Situation | Behavior |
 |-----------|----------|
-| New Host | Write `hosts.conf`; store password in Keychain when provided |
-| Already in `hosts.conf` | Skip by default; `--force` updates config and Keychain |
-| Already in `~/.ssh/config` (ext) | Config unchanged; password column updates Keychain only |
+| New Host | Write `hosts.conf`; store a password only when that column has a value |
+| Already in `hosts.conf` | Skip by default; `--force` rewrites that Host block only. No password column leaves Keychain unchanged |
+| Already in `~/.ssh/config` (ext) | Not copied into `hosts.conf`; a password cell updates Keychain, empty or `-` deletes it |
 
 Common header aliases are accepted (e.g. `folder` → `category`). Run `--dry-run` first to verify the action summary.
 
-`vnssh export` writes the same columns **except `password`**. Re-importing an export file restores host config and `#v-2fa` / `#v-legacy`; Keychain secrets are not in the file.
+`vnssh export` writes the same columns **except `password`**. Re-importing that file, including with `--force`, restores host config and `#v-2fa` / `#v-legacy` and does not delete Keychain entries just because the password column is absent. An empty password or `-` deletes the entry.
 
 ## Configuration
 

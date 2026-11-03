@@ -29,6 +29,30 @@ class FatalDetectionTests(unittest.TestCase):
         self.assertFalse(vnssh.ssh_pre_session_fatal("Last login: today"))
         self.assertFalse(vnssh.ssh_pre_session_fatal(""))
 
+    def test_banner_does_not_kill_a_live_prompt(self) -> None:
+        banner = (
+            "WARNING: unauthorized access denied on this device\n"
+            "admin@sw's password: "
+        )
+        self.assertFalse(vnssh.ssh_pre_session_fatal(banner))
+        self.assertTrue(
+            vnssh.ssh_waiting_for_user_input(
+                banner, auto_password=False, password_sent=False
+            )
+        )
+
+    def test_passphrase_and_bare_password_pause_the_watchdog(self) -> None:
+        passphrase = "Enter passphrase for key '/tmp/id_ed25519': "
+        bare = "Password:"
+        otp = "请输入验证码: "
+        for prompt in (passphrase, bare, otp):
+            self.assertFalse(vnssh.ssh_pre_session_fatal(prompt))
+            self.assertTrue(
+                vnssh.ssh_waiting_for_user_input(
+                    prompt, auto_password=True, password_sent=True
+                )
+            )
+
 
 class WizardValidationTests(unittest.TestCase):
     def test_port_and_yes_no(self) -> None:
@@ -176,6 +200,225 @@ class CsvRoundTripTests(unittest.TestCase):
             self.assertEqual(row["auth"], "password")
             self.assertEqual(row["twofa"], "y")
             self.assertEqual(row["legacy"], "n")
+
+
+class RollbackSafeBehaviorTests(unittest.TestCase):
+    """Covers the 1.0.7 review fixes. Uses a temp config, not ~/.vnssh."""
+
+    def setUp(self) -> None:
+        self._saved = {
+            "HOSTS_CONF": vnssh.HOSTS_CONF,
+            "SSH_CONFIG": vnssh.SSH_CONFIG,
+            "VNSSH_DIR": vnssh.VNSSH_DIR,
+            "HISTORY_FILE": vnssh.HISTORY_FILE,
+            "keychain_has": vnssh.keychain_has,
+            "keychain_get": vnssh.keychain_get,
+            "keychain_set": vnssh.keychain_set,
+            "keychain_delete": vnssh.keychain_delete,
+        }
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        vnssh.VNSSH_DIR = root / "vnssh"
+        vnssh.VNSSH_DIR.mkdir()
+        vnssh.HOSTS_CONF = vnssh.VNSSH_DIR / "hosts.conf"
+        vnssh.HISTORY_FILE = vnssh.VNSSH_DIR / "history.json"
+        vnssh.SSH_CONFIG = root / "ssh_config"
+        vnssh.SSH_CONFIG.write_text(
+            "Host extone\n    HostName 10.1.1.1\n    User ext\n",
+            encoding="utf-8",
+        )
+        vnssh._RAW_HOSTS_CACHE = None
+        vnssh._SSH_G_CACHE = {}
+        vnssh._SSH_G_IDENTITY_CACHE = {}
+        self.keychain_ops: list = []
+        vnssh.keychain_has = lambda _account: False
+        vnssh.keychain_get = lambda _account: None
+        vnssh.keychain_set = lambda account, password: self.keychain_ops.append(
+            ("set", account, password)
+        )
+        vnssh.keychain_delete = lambda account, invalidate=True: self.keychain_ops.append(
+            ("del", account)
+        )
+
+    def tearDown(self) -> None:
+        for name, value in self._saved.items():
+            setattr(vnssh, name, value)
+        vnssh._RAW_HOSTS_CACHE = None
+        vnssh._SSH_G_CACHE = {}
+        vnssh._SSH_G_IDENTITY_CACHE = {}
+        self.tmp.cleanup()
+
+    def test_empty_query_sorts_by_last_used_not_count(self) -> None:
+        vnssh.HISTORY_FILE.write_text(
+            '{"old": {"count": 50, "last_used": "2020-01-01T00:00:00+00:00"},'
+            ' "new": {"count": 1, "last_used": "2026-10-13T00:00:00+00:00"}}',
+            encoding="utf-8",
+        )
+        ordered = [
+            conn.host
+            for conn in vnssh.sorted_connections(
+                [
+                    vnssh.Connection(host="old"),
+                    vnssh.Connection(host="plain"),
+                    vnssh.Connection(host="new"),
+                ],
+                "",
+            )
+        ]
+        self.assertEqual(ordered, ["new", "old", "plain"])
+
+    def test_upsert_replaces_one_block_and_keeps_the_rest(self) -> None:
+        original = (
+            "# Managed by vnssh\n"
+            "#v-f:Keep\n"
+            "Host keep\n"
+            "    HostName 10.0.0.1\n"
+            "    User root\n"
+            "    ProxyJump bastion\n"
+            "    # hand note\n"
+            "#v-f:Edit\n"
+            "Host editme\n"
+            "    HostName 10.0.0.2\n"
+            "    User admin\n"
+        )
+        vnssh.HOSTS_CONF.write_text(original, encoding="utf-8")
+        vnssh.upsert_host_block(
+            vnssh.WizardData(
+                host="editme",
+                hostname="10.9.9.9",
+                user="admin",
+                port="22",
+                folder="Edit",
+                auth=vnssh.AUTH_PASSWORD,
+                original_host="editme",
+            )
+        )
+        text = vnssh.HOSTS_CONF.read_text(encoding="utf-8")
+        keep = text.split("#v-f:Edit", 1)[0]
+        self.assertIn("Host keep", keep)
+        self.assertIn("ProxyJump bastion", keep)
+        self.assertIn("# hand note", keep)
+        self.assertIn("HostName 10.9.9.9", text)
+        self.assertNotIn("HostName 10.0.0.2", text)
+        self.assertTrue((vnssh.VNSSH_DIR / "hosts.conf.bak").exists())
+
+    def test_remove_drops_one_block_only(self) -> None:
+        vnssh.HOSTS_CONF.write_text(
+            "# Managed by vnssh\n"
+            "#v-f:Keep\n"
+            "Host keep\n"
+            "    HostName 10.0.0.1\n"
+            "    LocalForward 127.0.0.1:80 10.0.0.1:80\n"
+            "#v-f:Gone\n"
+            "Host gone\n"
+            "    HostName 10.0.0.2\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(vnssh.remove_host_block("gone"))
+        text = vnssh.HOSTS_CONF.read_text(encoding="utf-8")
+        self.assertIn("LocalForward 127.0.0.1:80 10.0.0.1:80", text)
+        self.assertNotIn("Host gone", text)
+        self.assertIn("Host keep", text)
+
+    def test_dedupe_keeps_the_first_host(self) -> None:
+        entries = [
+            ("a", {"hostname": "1.1.1.1"}, "F"),
+            ("a", {"hostname": "2.2.2.2"}, "F"),
+        ]
+        deduped = vnssh.dedupe_config_entries(entries)
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(deduped[0][1]["hostname"], "1.1.1.1")
+
+    def test_ascii_alias_does_not_pin_identity_or_pubkey(self) -> None:
+        vnssh.HOSTS_CONF.write_text(
+            "#v-f:W\n"
+            "Host jumphost\n"
+            "    HostName 10.0.0.5\n"
+            "    User alice\n"
+            "    Port 2222\n"
+            "    IdentityFile /tmp/key.pem\n",
+            encoding="utf-8",
+        )
+        vnssh._RAW_HOSTS_CACHE = None
+        args = vnssh.build_ssh_argv("jumphost")
+        self.assertIn("jumphost", args)
+        self.assertIn("2222", args)
+        self.assertNotIn("-i", args)
+        self.assertFalse(any("IdentitiesOnly" in arg for arg in args))
+        self.assertFalse(any("PubkeyAuthentication" in arg for arg in args))
+        self.assertFalse(any("PreferredAuthentications" in arg for arg in args))
+
+    def test_non_ascii_alias_still_passes_the_key(self) -> None:
+        vnssh.HOSTS_CONF.write_text(
+            "#v-f:W\n"
+            "Host 堡垒\n"
+            "    HostName 10.9.9.9\n"
+            "    User bob\n"
+            "    IdentityFile /tmp/key.pem\n",
+            encoding="utf-8",
+        )
+        vnssh._RAW_HOSTS_CACHE = None
+        args = vnssh.build_ssh_argv("堡垒")
+        self.assertIn("-i", args)
+        self.assertIn("/tmp/key.pem", args)
+        self.assertIn("IdentitiesOnly=yes", args)
+        self.assertIn("bob@10.9.9.9", args)
+        self.assertNotIn("堡垒", args)
+
+    def test_import_password_column_rules(self) -> None:
+        absent = vnssh.WizardData(host="a", password_specified=False, password="")
+        blank = vnssh.WizardData(host="a", password_specified=True, password="")
+        dash = vnssh.WizardData(host="a", password_specified=True, password="-")
+        stored = vnssh.WizardData(host="a", password_specified=True, password="s3cret")
+        self.assertIsNone(vnssh.import_password_update(absent))
+        self.assertEqual(vnssh.import_password_update(blank), "")
+        self.assertEqual(vnssh.import_password_update(dash), "")
+        self.assertEqual(vnssh.import_password_update(stored), "s3cret")
+
+    def test_import_force_skips_ext_and_keeps_keychain_without_password(self) -> None:
+        vnssh.HOSTS_CONF.write_text(
+            "# Managed by vnssh\n"
+            "#v-f:Lab\n"
+            "Host kept\n"
+            "    HostName 10.0.0.1\n"
+            "    User root\n"
+            "    SendEnv LANG\n",
+            encoding="utf-8",
+        )
+        csv_path = Path(self.tmp.name) / "hosts.csv"
+        csv_path.write_text(
+            "category,host,hostname,user,port,auth\n"
+            "Lab,kept,10.0.0.9,root,22,password\n"
+            "Lab,extone,10.1.1.1,ext,22,password\n"
+            "Lab,newone,10.2.2.2,neo,22,key\n",
+            encoding="utf-8",
+        )
+        vnssh._RAW_HOSTS_CACHE = None
+        for row in vnssh.read_import_csv(csv_path):
+            self.assertFalse(row.password_specified)
+            vnssh.import_wizard_data(row, force=True)
+        text = vnssh.HOSTS_CONF.read_text(encoding="utf-8")
+        self.assertIn("HostName 10.0.0.9", text)
+        self.assertIn("sendenv LANG", text)
+        self.assertNotIn("Host extone", text)
+        self.assertIn("Host newone", text)
+        self.assertEqual(self.keychain_ops, [])
+
+    def test_search_window_uses_display_columns(self) -> None:
+        visible, columns = vnssh.search_query_window("生产环境", 4)
+        self.assertEqual(visible, "环境")
+        self.assertEqual(columns, 4)
+        visible, columns = vnssh.search_query_window("ab", 10)
+        self.assertEqual((visible, columns), ("ab", 2))
+
+    def test_help_hints_follow_focus(self) -> None:
+        listed = vnssh.help_hints_for_focus("list")
+        typing = vnssh.help_hints_for_focus("input")
+        self.assertIn(("e", "edit"), listed)
+        self.assertIn(("Enter", "connect"), listed)
+        self.assertIn(("type", "filter"), typing)
+        self.assertIn(("Esc", "clear/quit"), typing)
+        self.assertNotIn(("e", "edit"), typing)
 
 
 if __name__ == "__main__":

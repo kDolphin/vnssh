@@ -33,7 +33,7 @@ from typing import Dict, List, Optional, Tuple
 # Paths & constants
 # ---------------------------------------------------------------------------
 
-__version__ = "1.0.6"
+__version__ = "1.0.7"
 
 VNSSH_DIR = Path.home() / ".vnssh"
 VNSSH_TERMINAL_TITLE = f"vnssh {__version__}"
@@ -97,15 +97,24 @@ DEFAULT_IDENTITY = "~/.ssh/id_ed25519"
 MIN_TERMINAL_HEIGHT = 16
 MIN_PAGE_SIZE = 3
 KEY_CTRL_N = 14
-HELP_HINTS: List[Tuple[str, str]] = [
+HELP_HINTS_LIST: List[Tuple[str, str]] = [
     ("Enter", "connect"),
     ("C-n", "new"),
     ("e", "edit"),
     ("d", "delete"),
     ("↑↓", "select"),
-    ("PgUp/PgDn C-b/C-f", "page"),
+    ("PgUp/PgDn", "page"),
+    ("Esc", "search"),
+]
+HELP_HINTS_INPUT: List[Tuple[str, str]] = [
+    ("Enter", "open list"),
+    ("C-n", "new"),
+    ("type", "filter"),
+    ("Up", "list"),
+    ("PgUp/PgDn", "page"),
     ("Esc", "clear/quit"),
 ]
+HELP_HINTS = HELP_HINTS_LIST
 HELP_SPLIT_INDEX = 4
 HELP_SEGMENT_SEP = "  "
 
@@ -221,6 +230,7 @@ class WizardData:
     auth: str = AUTH_PASSWORD
     identity_file: str = DEFAULT_IDENTITY
     password: str = ""
+    password_specified: bool = False
     folder: str = ""
     original_host: str = ""
     # None = leave existing #v-2fa / #v-legacy untouched (CSV import / rewrite).
@@ -447,8 +457,8 @@ def record_use(host: str) -> None:
     save_history(data)
 
 
-def history_score(host: str) -> float:
-    data = load_history()
+def history_score(host: str, history: Optional[Dict[str, dict]] = None) -> float:
+    data = load_history() if history is None else history
     entry = data.get(host)
     if not entry:
         return 0.0
@@ -463,6 +473,13 @@ def history_score(host: str) -> float:
         except ValueError:
             recency = 0.0
     return count * 0.7 + recency * 0.3
+
+
+def history_last_used(host: str, history: Optional[Dict[str, dict]] = None) -> str:
+    """ISO timestamp of the last connect, or '' when the host has no history."""
+    data = load_history() if history is None else history
+    entry = data.get(host) or {}
+    return str(entry.get("last_used") or "")
 
 
 def rename_history(old: str, new: str) -> None:
@@ -940,11 +957,12 @@ KNOWN_HOST_BLOCK_KEYS = frozenset(
 )
 
 
-def backup_hosts_conf(path: Path = HOSTS_CONF) -> None:
-    if not path.exists():
+def backup_hosts_conf(path: Optional[Path] = None) -> None:
+    target = HOSTS_CONF if path is None else path
+    if not target.exists():
         return
-    backup_path = path.with_name(f"{path.name}.bak")
-    shutil.copy2(path, backup_path)
+    backup_path = target.with_name(f"{target.name}.bak")
+    shutil.copy2(target, backup_path)
 
 
 def host_entry_to_wizard(host: str, opts: Dict[str, str], folder: str) -> WizardData:
@@ -1022,25 +1040,110 @@ def format_parsed_host_block(host: str, opts: Dict[str, str], folder: str) -> st
 
 
 def write_hosts_conf(
-    entries: List[Tuple[str, Dict[str, str], str]], path: Path = HOSTS_CONF
+    entries: List[Tuple[str, Dict[str, str], str]], path: Optional[Path] = None
 ) -> None:
+    target = HOSTS_CONF if path is None else path
     ensure_vnssh_dir()
-    backup_hosts_conf(path)
+    backup_hosts_conf(target)
     parts = ["# Managed by vnssh"]
     for host, opts, folder in dedupe_config_entries(entries):
         parts.append(format_parsed_host_block(host, opts, folder).rstrip())
-    path.write_text("\n".join(parts) + "\n", encoding="utf-8")
+    target.write_text("\n".join(parts) + "\n", encoding="utf-8")
 
 
-def remove_host_block(host: str, path: Path = HOSTS_CONF) -> bool:
-    text = read_config_text(path)
+def _is_host_preamble(line: str) -> bool:
+    if parse_folder_comment(line) is not None:
+        return True
+    if parse_legacy_comment(line) or parse_twofa_comment(line):
+        return True
+    return False
+
+
+def _host_names_on_line(line: str) -> List[str]:
+    try:
+        parts = shlex.split(line)
+    except ValueError:
+        parts = line.split()
+    return parts[1:] if len(parts) > 1 else []
+
+
+def host_block_spans(text: str) -> List[Tuple[List[str], int, int]]:
+    """Return (aliases, start_line, end_line) for each Host stanza.
+
+    The span includes the #v-f / #v-2fa / #v-legacy lines directly above the
+    Host line. Later duplicate aliases are separate spans; callers that match
+    OpenSSH keep the first span.
+    """
+    lines = text.splitlines()
+    starts: List[Tuple[List[str], int]] = []
+    pending: Optional[int] = None
+    for index, raw in enumerate(lines):
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            if _is_host_preamble(line) and pending is None:
+                pending = index
+            continue
+        if line.lower().startswith("host "):
+            start = pending if pending is not None else index
+            starts.append((_host_names_on_line(line), start))
+            pending = None
+            continue
+        pending = None
+    spans: List[Tuple[List[str], int, int]] = []
+    for index, (names, start) in enumerate(starts):
+        end = starts[index + 1][1] if index + 1 < len(starts) else len(lines)
+        spans.append((names, start, end))
+    return spans
+
+
+def _first_span_for_host(
+    spans: List[Tuple[List[str], int, int]], host: str
+) -> Optional[Tuple[int, int]]:
+    for names, start, end in spans:
+        if host in names:
+            return start, end
+    return None
+
+
+def splice_host_block(text: str, host: str, new_block: str) -> str:
+    """Replace the first stanza for host, or append it. Other text stays put."""
+    lines = text.splitlines(keepends=True)
+    span = _first_span_for_host(host_block_spans(text), host)
+    block = new_block if new_block.endswith("\n") else new_block + "\n"
+    new_lines = block.splitlines(keepends=True)
+    if new_lines and not new_lines[-1].endswith("\n"):
+        new_lines[-1] += "\n"
+    if span is None:
+        prefix = text
+        if prefix and not prefix.endswith("\n"):
+            prefix += "\n"
+        return prefix + block
+    start, end = span
+    return "".join(lines[:start] + new_lines + lines[end:])
+
+
+def splice_remove_host(text: str, host: str) -> Optional[str]:
+    """Drop the first stanza for host. None when that alias is absent."""
+    lines = text.splitlines(keepends=True)
+    span = _first_span_for_host(host_block_spans(text), host)
+    if span is None:
+        return None
+    start, end = span
+    return "".join(lines[:start] + lines[end:])
+
+
+def remove_host_block(host: str, path: Optional[Path] = None) -> bool:
+    target = HOSTS_CONF if path is None else path
+    text = read_config_text(target)
     if not text:
         return False
-    entries = parse_config_entries(text)
-    filtered = [(h, opts, folder) for h, opts, folder in entries if h != host]
-    if len(filtered) == len(entries):
+    updated = splice_remove_host(text, host)
+    if updated is None:
         return False
-    write_hosts_conf(filtered, path)
+    backup_hosts_conf(target)
+    target.write_text(updated, encoding="utf-8")
     return True
 
 
@@ -1064,25 +1167,16 @@ def upsert_host_block(data: WizardData) -> None:
             prior_opts = opts
             break
 
-    new_entry = (
-        data.host,
-        merged_opts_from_wizard(data, prior_opts),
-        normalize_folder(data.folder),
-    )
-
-    new_entries: List[Tuple[str, Dict[str, str], str]] = []
-    replaced = False
-    for host, opts, folder in entries:
-        if host == remove_name:
-            if not replaced:
-                new_entries.append(new_entry)
-                replaced = True
-            continue
-        new_entries.append((host, opts, folder))
-    if not replaced:
-        new_entries.append(new_entry)
-
-    write_hosts_conf(dedupe_config_entries(new_entries))
+    opts = merged_opts_from_wizard(data, prior_opts)
+    folder = normalize_folder(data.folder)
+    block = format_parsed_host_block(data.host, opts, folder)
+    if data.original_host and data.original_host != data.host:
+        removed = splice_remove_host(text, data.original_host)
+        if removed is not None:
+            text = removed
+    updated = splice_host_block(text, data.host, block)
+    backup_hosts_conf(HOSTS_CONF)
+    HOSTS_CONF.write_text(updated, encoding="utf-8")
     if data.legacy:
         ensure_legacy_ip_stanzas()
 
@@ -1164,36 +1258,47 @@ def connection_matches(conn: Connection, query: str) -> bool:
     return False
 
 
-def match_rank(conn: Connection, query: str) -> Tuple[int, float]:
+def match_rank(
+    conn: Connection,
+    query: str,
+    history: Optional[Dict[str, dict]] = None,
+) -> Tuple[int, float]:
+    score = history_score(conn.host, history)
     if not query:
-        return (0, -history_score(conn.host))
+        return (0, -score)
     q = query.lower()
     host_l = conn.host.lower()
     if host_l == q:
-        return (0, -history_score(conn.host))
+        return (0, -score)
     if host_l.startswith(q):
-        return (1, -history_score(conn.host))
+        return (1, -score)
     if q in host_l:
-        return (2, -history_score(conn.host))
+        return (2, -score)
     if q in (conn.hostname or "").lower():
-        return (3, -history_score(conn.host))
+        return (3, -score)
     if q in conn.folder_display.lower():
-        return (4, -history_score(conn.host))
+        return (4, -score)
 
     py = pinyin_keys(conn.folder_display) + " " + pinyin_keys(conn.host)
     if py and q in py:
-        return (5, -history_score(conn.host))
+        return (5, -score)
     if q in conn.search_blob:
-        return (6, -history_score(conn.host))
-    return (7, -history_score(conn.host))
+        return (6, -score)
+    return (7, -score)
 
 
 def sorted_connections(connections: List[Connection], query: str) -> List[Connection]:
     filtered = [c for c in connections if connection_matches(c, query)]
+    history = load_history()
     if query:
-        filtered.sort(key=lambda c: match_rank(c, query))
-    else:
-        filtered.sort(key=lambda c: -history_score(c.host))
+        filtered.sort(key=lambda c: match_rank(c, query, history))
+        return filtered
+    # Empty query: most recently connected first. Never-used hosts sort last.
+    filtered.sort(key=lambda c: c.host.lower())
+    filtered.sort(
+        key=lambda c: history_last_used(c.host, history) or "0000",
+        reverse=True,
+    )
     return filtered
 
 
@@ -1538,13 +1643,16 @@ def resolve_ssh_endpoint(host: str) -> Tuple[str, List[str]]:
     extra: List[str] = []
     if port != DEFAULT_PORT:
         extra.extend(["-p", str(port)])
+    if is_valid_ssh_host_argument(host):
+        # A legal alias lets OpenSSH apply each hop's own IdentityFile.
+        # -i and IdentitiesOnly on the command line would bind every hop
+        # to the destination key.
+        return host, extra
+
     identity = opts.get("identityfile")
     if identity:
         extra.extend(["-i", os.path.expanduser(identity)])
         extra.extend(["-o", "IdentitiesOnly=yes"])
-
-    if is_valid_ssh_host_argument(host):
-        return host, extra
 
     if hostname:
         target = f"{user}@{hostname}" if user else hostname
@@ -1804,28 +1912,31 @@ def build_ssh_argv(host: str, *, legacy: Optional[bool] = None) -> List[str]:
     entry = raw.get(host)
     opts = entry[0] if entry else {}
     use_legacy = legacy if legacy is not None else opts.get("_vnssh_legacy") == "1"
-    mode = connection_auth_mode(host)
-    if mode == AUTH_PASSWORD and keychain_has(host):
-        args.extend(
-            [
-                "-o",
-                "PreferredAuthentications=keyboard-interactive,password",
-                "-o",
-                "PubkeyAuthentication=no",
-            ]
-        )
-    elif mode == AUTH_KEY:
-        # Avoid password-prompt noise when the key is missing/unreadable.
-        args.extend(
-            [
-                "-o",
-                "PreferredAuthentications=publickey",
-                "-o",
-                "PasswordAuthentication=no",
-                "-o",
-                "KbdInteractiveAuthentication=no",
-            ]
-        )
+    # Auth method and identity come from the Host block when the alias is a
+    # legal ssh argument. Forcing PubkeyAuthentication or IdentitiesOnly here
+    # applies to every ProxyJump hop, not just the destination.
+    if not is_valid_ssh_host_argument(host):
+        mode = connection_auth_mode(host)
+        if mode == AUTH_PASSWORD and keychain_has(host):
+            args.extend(
+                [
+                    "-o",
+                    "PreferredAuthentications=keyboard-interactive,password",
+                    "-o",
+                    "PubkeyAuthentication=no",
+                ]
+            )
+        elif mode == AUTH_KEY:
+            args.extend(
+                [
+                    "-o",
+                    "PreferredAuthentications=publickey",
+                    "-o",
+                    "PasswordAuthentication=no",
+                    "-o",
+                    "KbdInteractiveAuthentication=no",
+                ]
+            )
     if use_legacy:
         args.extend(legacy_ssh_option_args())
     target, extra = resolve_ssh_endpoint(host)
@@ -2039,14 +2150,33 @@ def _prompt_line_complete(line: str) -> bool:
     return any(marker.search(line) for marker in _TWOFA_PASSWORD_PROMPT_MARKERS)
 
 
+def _line_awaits_user(line: str) -> bool:
+    """True for a password, passphrase, OTP, or similar prompt line."""
+    if any(marker.search(line) for marker in _VERIFICATION_PROMPT_MARKERS):
+        return True
+    if any(marker.search(line) for marker in _TWOFA_PASSWORD_PROMPT_MARKERS):
+        return True
+    if _OPENSSH_PASSWORD_PROMPT.search(line):
+        return True
+    if re.search(r"(?i)passphrase", line):
+        return True
+    if re.search(r"(?i)passcode", line):
+        return True
+    if re.search(r"(?i)\bpin\b", line) and re.search(r"[:：?？]", line):
+        return True
+    if re.search(r"(?i)(?:^|\s)password\s*[:：]\s*$", line):
+        return True
+    return False
+
+
+def _output_awaits_user(recent_text: str) -> bool:
+    return any(_line_awaits_user(line) for line in _recent_output_lines(recent_text, tail=4))
+
+
 def _password_prompt_signature(
     recent_text: str, *, allow_standard_password: bool = False
 ) -> Optional[str]:
-    if _has_auth_failure(recent_text):
-        return None
-    tail = _strip_ansi(recent_text)[-2000:]
-    if any(marker.search(tail) for marker in _VERIFICATION_PROMPT_MARKERS):
-        return None
+    # A live prompt wins over an earlier banner that says "access denied".
     for line in reversed(_recent_output_lines(recent_text)):
         if any(marker.search(line) for marker in _VERIFICATION_PROMPT_MARKERS):
             return None
@@ -2054,6 +2184,14 @@ def _password_prompt_signature(
             return line if _prompt_line_complete(line) else None
         if allow_standard_password and _OPENSSH_PASSWORD_PROMPT.search(line):
             return line
+        if allow_standard_password and re.search(r"(?i)passphrase", line):
+            return line if _prompt_line_complete(line) else None
+        if allow_standard_password and re.search(
+            r"(?i)(?:^|\s)password\s*[:：]\s*$", line
+        ):
+            return line
+    if _has_auth_failure(recent_text):
+        return None
     return None
 
 
@@ -2421,7 +2559,15 @@ def archive_pending_session_weeks(week_labels: List[str]) -> None:
 
 
 def ssh_pre_session_fatal(recent_text: str) -> bool:
-    """True when SSH printed a hard failure before an interactive session."""
+    """True when SSH printed a hard failure before an interactive session.
+
+    A password, passphrase, or OTP prompt means the user is still in the
+    login, even if an earlier banner contains "access denied".
+    """
+    if not recent_text or not recent_text.strip():
+        return False
+    if _output_awaits_user(recent_text):
+        return False
     clean = _strip_ansi(recent_text)
     return any(marker.search(clean) for marker in _PRE_SESSION_FATAL_MARKERS)
 
@@ -2433,7 +2579,7 @@ def ssh_waiting_for_user_input(
     password_sent: bool,
 ) -> bool:
     """Pause connect deadline while the user must type (OTP, password, yes/no)."""
-    if _has_active_verification_prompt(recent_text):
+    if _has_active_verification_prompt(recent_text) or _output_awaits_user(recent_text):
         return True
     tail = _strip_ansi(recent_text)[-2000:]
     if re.search(r"(?i)are you sure you want to continue connecting", tail):
@@ -3282,14 +3428,42 @@ def help_line_display_width(segments: List[Tuple[str, str]]) -> int:
     return total
 
 
-def help_lines_for_width(width: int) -> List[List[Tuple[str, str]]]:
-    inner = max(0, width - 2)
-    if help_line_display_width(HELP_HINTS) <= inner:
-        return [HELP_HINTS]
+def help_hints_for_focus(focus: str) -> List[Tuple[str, str]]:
+    if focus == "input":
+        return HELP_HINTS_INPUT
+    return HELP_HINTS_LIST
 
-    first = HELP_HINTS[:HELP_SPLIT_INDEX]
-    second = HELP_HINTS[HELP_SPLIT_INDEX:]
+
+def help_lines_for_width(
+    width: int, focus: str = "list"
+) -> List[List[Tuple[str, str]]]:
+    hints = help_hints_for_focus(focus)
+    inner = max(0, width - 2)
+    if help_line_display_width(hints) <= inner:
+        return [hints]
+
+    first = hints[:HELP_SPLIT_INDEX]
+    second = hints[HELP_SPLIT_INDEX:]
     return [first, second]
+
+
+def search_query_window(query: str, max_width: int) -> Tuple[str, int]:
+    """Clip a search query by display columns, keeping the end (the cursor).
+
+    Returns (visible text, cursor column within that text).
+    """
+    if max_width <= 0 or not query:
+        return "", 0
+    shown: List[str] = []
+    used = 0
+    for char in reversed(query):
+        width = char_display_width(char)
+        if used + width > max_width:
+            break
+        shown.append(char)
+        used += width
+    shown.reverse()
+    return "".join(shown), used
 
 
 def draw_key_desc(
@@ -3778,7 +3952,7 @@ class MainUI:
 
     def layout(self) -> Dict[str, int]:
         height, width = self.stdscr.getmaxyx()
-        help_rows = help_lines_for_width(width)
+        help_rows = help_lines_for_width(width, self.focus)
         help_count = len(help_rows)
         help_start = height - help_count
         input_bottom_row = help_start - 1
@@ -3868,6 +4042,18 @@ class MainUI:
             return True
         self.focus_input()
         return False
+
+    def focus_filtered_index(self, index: int) -> None:
+        """Select a row in the filtered list. Negative index means no rows."""
+        if index < 0 or not self.filtered:
+            self.focus_input()
+            return
+        index = min(index, len(self.filtered) - 1)
+        page = max(1, self.layout()["page_size"])
+        self.scroll = 0 if index < page else index - page + 1
+        self.list_cursor = index - self.scroll
+        self.focus = "list"
+        self.clamp_scroll()
 
     def resume_after_ssh(self, selected_host: str = "") -> None:
         clear_terminal_screen()
@@ -3997,15 +4183,10 @@ class MainUI:
         safe_addstr(stdscr, row, content_x, SEARCH_PREFIX, focus_attr(focused))
         x = content_x + len(SEARCH_PREFIX)
         max_query = max(0, content_w - len(SEARCH_PREFIX))
-        if self.query:
-            safe_addstr(
-                stdscr,
-                row,
-                x,
-                self.query[:max_query],
-                focus_attr(focused),
-            )
-            x += min(len(self.query), max_query)
+        if self.query and max_query:
+            visible, cursor_cols = search_query_window(self.query, max_query)
+            safe_addstr(stdscr, row, x, visible, focus_attr(focused))
+            x += cursor_cols
         if focused and self._blink_on and x < right:
             safe_addstr(stdscr, row, x, " ", curses.A_REVERSE)
         elif not self.query and not focused and x < right:
@@ -4129,8 +4310,10 @@ class MainUI:
             self.draw()
 
     def open_new_wizard(self) -> None:
-        wizard_new(self.stdscr)
-        self.reload_connections()
+        result = wizard_new(self.stdscr)
+        if result is None:
+            return
+        self.select_host(result.host)
 
     def handle_input_key(self, ch: int, char: Optional[str]) -> Optional[str]:
         if ch not in (-1,):
@@ -4243,16 +4426,21 @@ class MainUI:
                 conn = self.selected_connection()
                 if conn:
                     self.message = ""
-                    wizard_edit(self.stdscr, conn)
-                    self.reload_connections()
+                    result = wizard_edit(self.stdscr, conn)
+                    if result is not None:
+                        self.select_host(result.host)
                 else:
                     self.message = "Select a connection to edit"
             elif action == "delete":
                 conn = self.selected_connection()
                 if conn:
                     self.message = ""
+                    deleted_index = self.scroll + self.list_cursor
                     if delete_connection(self.stdscr, conn):
-                        self.reload_connections()
+                        self.reload_connections(reset_scroll=False)
+                        self.focus_filtered_index(
+                            deleted_index if self.filtered else -1
+                        )
                 else:
                     self.message = "Select a connection to delete"
 
@@ -4444,7 +4632,8 @@ def row_to_wizard(row: Dict[str, str]) -> WizardData:
         raise ValueError(f"{host}: missing user")
 
     port = row.get("port", "").strip() or str(DEFAULT_PORT)
-    password = row.get("password", "")
+    password_specified = "password" in row
+    password = row.get("password", "") if password_specified else ""
     identity_file = row.get("identity_file", "").strip()
     auth = parse_import_auth(row.get("auth", ""), identity_file, password)
 
@@ -4462,9 +4651,23 @@ def row_to_wizard(row: Dict[str, str]) -> WizardData:
         auth=auth,
         identity_file=identity_file or DEFAULT_IDENTITY,
         password=password,
+        password_specified=password_specified,
         twofa=twofa,
         legacy=legacy,
     )
+
+
+def import_password_update(data: WizardData) -> Optional[str]:
+    """Keychain change for a CSV row.
+
+    None leaves the existing item alone (password column absent).
+    '' deletes. Any other string is stored.
+    """
+    if not data.password_specified:
+        return None
+    if data.password == "" or data.password == PASSWORD_DELETE_TOKEN:
+        return ""
+    return data.password
 
 
 def host_is_managed(host: str) -> bool:
@@ -4483,8 +4686,18 @@ def plan_import_action(data: WizardData, force: bool = False) -> str:
     if host_exists(data.host):
         if host_is_managed(data.host):
             return "update_managed" if force else "skip_managed"
-        return "keychain_ext" if data.password else "skip_ext"
+        # ext hosts stay in ~/.ssh/config. A password cell may update Keychain.
+        if data.password_specified:
+            return "keychain_ext"
+        return "skip_ext"
     return "add"
+
+
+def apply_import_keychain(data: WizardData) -> None:
+    update = import_password_update(data)
+    if update is None:
+        return
+    apply_keychain_password(data.host, update)
 
 
 def import_wizard_data(data: WizardData, force: bool = False, dry_run: bool = False) -> str:
@@ -4499,22 +4712,16 @@ def import_wizard_data(data: WizardData, force: bool = False, dry_run: bool = Fa
     if action == "update_managed":
         data.original_host = data.host
         upsert_host_block(data)
-        if data.auth in (AUTH_PASSWORD, AUTH_BOTH):
-            apply_keychain_password(data.host, data.password)
-        else:
-            keychain_delete(data.host)
+        apply_import_keychain(data)
         apply_wizard_identity_permissions(data)
         return action
 
     if action == "keychain_ext":
-        apply_keychain_password(data.host, data.password)
+        apply_import_keychain(data)
         return action
 
     upsert_host_block(data)
-    if data.auth in (AUTH_PASSWORD, AUTH_BOTH):
-        apply_keychain_password(data.host, data.password)
-    else:
-        keychain_delete(data.host)
+    apply_import_keychain(data)
     apply_wizard_identity_permissions(data)
     return "add"
 
@@ -4522,16 +4729,15 @@ def import_wizard_data(data: WizardData, force: bool = False, dry_run: bool = Fa
 def dedupe_config_entries(
     entries: List[Tuple[str, Dict[str, str], str]],
 ) -> List[Tuple[str, Dict[str, str], str]]:
-    """Keep the last occurrence of each Host alias."""
+    """Keep the first occurrence of each Host alias, matching OpenSSH."""
     seen: set[str] = set()
-    deduped_reversed: List[Tuple[str, Dict[str, str], str]] = []
-    for host, opts, folder in reversed(entries):
+    deduped: List[Tuple[str, Dict[str, str], str]] = []
+    for host, opts, folder in entries:
         if host in seen:
             continue
         seen.add(host)
-        deduped_reversed.append((host, opts, folder))
-    deduped_reversed.reverse()
-    return deduped_reversed
+        deduped.append((host, opts, folder))
+    return deduped
 
 
 def rebuild_hosts_from_csv(rows: List[WizardData]) -> None:
@@ -4594,8 +4800,9 @@ def cmd_import(argv: List[str]) -> None:
             "\n"
             "Rules:\n"
             "  - New Host -> write ~/.vnssh/hosts.conf + Keychain\n"
-            "  - Existing in ~/.ssh/config [ext] -> import password to Keychain only\n"
-            "  - Existing in hosts.conf -> skip by default; --force overwrites config and password\n"
+            "  - Existing in ~/.ssh/config [ext] -> Keychain only; never copied into hosts.conf\n"
+            "  - Existing in hosts.conf -> skip by default; --force overwrites that Host block\n"
+            "  - Password column absent -> leave Keychain unchanged; empty or '-' deletes\n"
             "\n"
             "auth values: password / key / both (or 1 / 2 / 3)"
         )
@@ -4619,35 +4826,24 @@ def cmd_import(argv: List[str]) -> None:
 
     prefix = "[dry-run] " if dry_run else ""
 
-    if force and not dry_run:
-        rebuild_hosts_from_csv(rows)
-        for data in rows:
-            if data.auth in (AUTH_PASSWORD, AUTH_BOTH):
-                apply_keychain_password(data.host, data.password)
-            else:
-                keychain_delete(data.host)
-            stats["update_managed"] += 1
+    for data in rows:
+        action = import_wizard_data(data, force=force, dry_run=dry_run)
+
+        stats[action] = stats.get(action, 0) + 1
+
+        if action == "add":
+            print(f"{prefix}Added {data.host} -> {data.user}@{data.hostname}")
+        elif action == "update_managed":
             print(f"{prefix}Updated {data.host}")
-    else:
-        for data in rows:
-            action = import_wizard_data(data, force=force, dry_run=dry_run)
-
-            stats[action] = stats.get(action, 0) + 1
-
-            if action == "add":
-                print(f"{prefix}Added {data.host} -> {data.user}@{data.hostname}")
-            elif action == "update_managed":
-                print(f"{prefix}Updated {data.host}")
-            elif action == "keychain_ext":
-                print(f"{prefix}Keychain only [ext] {data.host}")
-            elif action == "skip_managed":
-                print(
-                    f"{prefix}Skipped (exists in hosts.conf): {data.host} "
-                    f"(use --force to overwrite)"
-                )
-            elif action == "skip_ext":
-                print(f"{prefix}Skipped [ext] {data.host} (no password column)")
-
+        elif action == "keychain_ext":
+            print(f"{prefix}Keychain only [ext] {data.host}")
+        elif action == "skip_managed":
+            print(
+                f"{prefix}Skipped (exists in hosts.conf): {data.host} "
+                f"(use --force to overwrite)"
+            )
+        elif action == "skip_ext":
+            print(f"{prefix}Skipped [ext] {data.host} (no password column)")
     print(
         f"\n{prefix}Done: added {stats['add']}, "
         f"updated {stats['update_managed']}, "

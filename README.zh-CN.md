@@ -2,7 +2,7 @@
 
 macOS 终端 SSH 启动器，支持 **Keychain 密码存储** 与 **会话操作日志**。单文件 `vnssh.py` 分发，依赖系统 Python 3 与 OpenSSH，无第三方包。
 
-当前版本：**1.0.6**（`vnssh --version`）。
+当前版本：**1.0.7**（`vnssh --version`）。
 
 [English](README.md)
 
@@ -148,13 +148,13 @@ vnssh export backup.csv                 # 指定路径
 
 | 目标状态 | 行为 |
 |----------|------|
-| 新 Host | 写入 `hosts.conf`；若提供密码则写入 Keychain |
-| 已存在于 `hosts.conf` | 默认跳过；`--force` 时更新配置与 Keychain |
-| 已存在于 `~/.ssh/config`（ext） | 不修改其配置；CSV 含密码列时仅导入 Keychain |
+| 新 Host | 写入 `hosts.conf`；密码列有值才写入 Keychain |
+| 已存在于 `hosts.conf` | 默认跳过；`--force` 时只改这一段 Host。没有密码列则不动 Keychain |
+| 已存在于 `~/.ssh/config`（ext） | 不写入 `hosts.conf`；密码列有值才改 Keychain，空或 `-` 删除 |
 
 表头支持常见别名（如 `folder` → `category`）。建议先 `--dry-run` 核对统计。
 
-`vnssh export` 写出上述列，**不含 `password`**。用导出文件再 import 可恢复主机配置和 `#v-2fa` / `#v-legacy`，Keychain 密码不在文件里。
+`vnssh export` 写出上述列，**不含 `password`**。用导出文件再 import（含 `--force`）可恢复主机配置和 `#v-2fa` / `#v-legacy`，不会因为没有密码列而删除 Keychain。空密码或 `-` 才会删除。
 
 ## 配置文件
 
