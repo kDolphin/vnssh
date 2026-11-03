@@ -3948,6 +3948,7 @@ class MainUI:
         self.filtered: List[Connection] = []
         self.message = ""
         self._blink_on = True
+        self._search_cursor: Optional[Tuple[int, int]] = None
         self.reload_connections()
 
     def layout(self) -> Dict[str, int]:
@@ -4187,7 +4188,8 @@ class MainUI:
             visible, cursor_cols = search_query_window(self.query, max_query)
             safe_addstr(stdscr, row, x, visible, focus_attr(focused))
             x += cursor_cols
-        if focused and self._blink_on and x < right:
+        self._search_cursor = (row, x) if x < right else None
+        if focused and self._blink_on and self._search_cursor is not None:
             safe_addstr(stdscr, row, x, " ", curses.A_REVERSE)
         elif not self.query and not focused and x < right:
             safe_addstr(stdscr, row, x, " ", help_desc_attr())
@@ -4235,9 +4237,21 @@ class MainUI:
         self.draw_input_box(stdscr, layout, width)
         self.draw_help_lines(stdscr, layout, width)
 
+    def paint_search_cursor(self) -> None:
+        """Toggle only the search cursor. A full redraw flashes the terminal."""
+        pos = self._search_cursor
+        if pos is None or self.focus != "input":
+            return
+        row, col = pos
+        attr = curses.A_REVERSE if self._blink_on else focus_attr(True)
+        safe_addstr(self.stdscr, row, col, " ", attr)
+        self.stdscr.refresh()
+
     def draw(self) -> None:
         stdscr = self.stdscr
-        stdscr.clear()
+        # erase() blanks the window image. clear() also asks the terminal to
+        # wipe the physical screen on refresh, which flashes every blink.
+        stdscr.erase()
         _height, width = stdscr.getmaxyx()
         layout = self.layout()
         draw_box_title(stdscr, f"vnssh {__version__}")
@@ -4388,18 +4402,24 @@ class MainUI:
 
     def run(self) -> None:
         ensure_include()
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        self.stdscr.leaveok(True)
         while True:
             self.draw()
-            if self.focus == "input":
-                self.stdscr.timeout(SEARCH_CURSOR_BLINK_MS)
-            else:
-                self.stdscr.timeout(-1)
-
-            char, ch = getch_utf8(self.stdscr)
-
-            if ch == -1 and self.focus == "input":
-                self._blink_on = not self._blink_on
-                continue
+            while True:
+                if self.focus == "input":
+                    self.stdscr.timeout(SEARCH_CURSOR_BLINK_MS)
+                else:
+                    self.stdscr.timeout(-1)
+                char, ch = getch_utf8(self.stdscr)
+                if ch == -1 and self.focus == "input":
+                    self._blink_on = not self._blink_on
+                    self.paint_search_cursor()
+                    continue
+                break
 
             action: Optional[str] = None
             if self.focus == "input":
