@@ -2,7 +2,7 @@
 
 macOS 终端 SSH 启动器，支持 **Keychain 密码存储** 与 **会话操作日志**。单文件 `vnssh.py` 分发，依赖系统 Python 3 与 OpenSSH，无第三方包。
 
-当前版本：**1.0.7**（`vnssh --version`）。
+当前版本：**1.0.8**（`vnssh --version`）。
 
 [English](README.md)
 

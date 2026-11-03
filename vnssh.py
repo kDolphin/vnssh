@@ -33,7 +33,7 @@ from typing import Dict, List, Optional, Tuple
 # Paths & constants
 # ---------------------------------------------------------------------------
 
-__version__ = "1.0.7"
+__version__ = "1.0.8"
 
 VNSSH_DIR = Path.home() / ".vnssh"
 VNSSH_TERMINAL_TITLE = f"vnssh {__version__}"
@@ -2082,6 +2082,21 @@ _VERIFICATION_PROMPT_MARKERS = (
     re.compile(r"\u52a8\u6001\u53e3\u4ee4"),
 )
 
+# OpenSSH prints these after a rejected attempt, then often asks again.
+# A banner that only says "access denied" is not in this list.
+_SSH_AUTH_REJECT_MARKERS = (
+    re.compile(r"(?i)permission denied"),
+    re.compile(r"(?i)authentication failed"),
+    re.compile(r"(?i)too many authentication failures"),
+    re.compile(r"(?i)login incorrect"),
+    re.compile(r"(?i)password\s*expired"),
+    re.compile(r"(?i)passwordexpired"),
+    re.compile(r"\u5bc6\u7801\u8fc7\u671f"),
+    re.compile(r"\u5bc6\u7801\u9519\u8bef"),
+    re.compile(r"\u8ba4\u8bc1\u5931\u8d25"),
+    re.compile(r"\u767b\u5f55\u5931\u8d25"),
+)
+
 _AUTH_FAILURE_MARKERS = (
     re.compile(r"(?i)password\s*expired"),
     re.compile(r"(?i)passwordexpired"),
@@ -2220,6 +2235,31 @@ def _parse_nested_login_success(recent_bytes: bytes) -> Optional[Tuple[str, int,
     )
 
 
+_PREAUTH_BANNER_MARKERS = (
+    re.compile(r"(?i)post-quantum"),
+    re.compile(r"(?i)store now, decrypt later"),
+    re.compile(r"(?i)openssh\.com/pq"),
+    re.compile(r"(?i)^warning:"),
+    re.compile(r"(?i)^\*\*"),
+)
+
+
+def _preauth_banner_only(recent_text: str) -> bool:
+    """True when output is only an OpenSSH warning, not a logged-in shell."""
+    lines = _recent_output_lines(recent_text, tail=12)
+    if not lines:
+        return True
+    for line in lines:
+        if _line_awaits_user(line):
+            return False
+        if any(marker.search(line) for marker in _SSH_CLIENT_MARKERS):
+            continue
+        if any(marker.search(line) for marker in _PREAUTH_BANNER_MARKERS):
+            continue
+        return False
+    return True
+
+
 def _session_ready_for_log(
     recent_text: str,
     *,
@@ -2234,9 +2274,16 @@ def _session_ready_for_log(
         return False
     if _has_active_verification_prompt(recent_text):
         return False
+    if _output_awaits_user(recent_text):
+        return False
     if (auto_password or twofa_enabled) and not password_sent:
         return False
     if len(tail.strip()) < 8:
+        return False
+    # A post-quantum warning is printed before authentication. Treating it as
+    # a live session disables the failure watchdog, so a rejected password
+    # never returns to the host list.
+    if _preauth_banner_only(recent_text):
         return False
     recent_lines = _recent_output_lines(recent_text, tail=6)
     if recent_lines and all(
@@ -2558,14 +2605,27 @@ def archive_pending_session_weeks(week_labels: List[str]) -> None:
             )
 
 
+def _ssh_auth_rejected(recent_text: str) -> bool:
+    """True when OpenSSH already rejected the attempt.
+
+    This stays true if ssh then reprints a password prompt. A login banner
+    that merely says "access denied" does not count.
+    """
+    clean = _strip_ansi(recent_text)
+    return any(marker.search(clean) for marker in _SSH_AUTH_REJECT_MARKERS)
+
+
 def ssh_pre_session_fatal(recent_text: str) -> bool:
     """True when SSH printed a hard failure before an interactive session.
 
     A password, passphrase, or OTP prompt means the user is still in the
-    login, even if an earlier banner contains "access denied".
+    login, even if an earlier banner contains "access denied". A real
+    "Permission denied" still ends the attempt when that prompt comes back.
     """
     if not recent_text or not recent_text.strip():
         return False
+    if _ssh_auth_rejected(recent_text):
+        return True
     if _output_awaits_user(recent_text):
         return False
     clean = _strip_ansi(recent_text)
@@ -2579,6 +2639,8 @@ def ssh_waiting_for_user_input(
     password_sent: bool,
 ) -> bool:
     """Pause connect deadline while the user must type (OTP, password, yes/no)."""
+    if _ssh_auth_rejected(recent_text):
+        return False
     if _has_active_verification_prompt(recent_text) or _output_awaits_user(recent_text):
         return True
     tail = _strip_ansi(recent_text)[-2000:]

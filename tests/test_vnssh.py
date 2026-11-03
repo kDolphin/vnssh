@@ -29,6 +29,51 @@ class FatalDetectionTests(unittest.TestCase):
         self.assertFalse(vnssh.ssh_pre_session_fatal("Last login: today"))
         self.assertFalse(vnssh.ssh_pre_session_fatal(""))
 
+    def test_preauth_banner_is_not_a_session(self) -> None:
+        banner = (
+            "** WARNING: connection is not using a post-quantum "
+            "key exchange algorithm.\n"
+        )
+        self.assertTrue(vnssh._preauth_banner_only(banner))
+        self.assertFalse(
+            vnssh._session_ready_for_log(
+                banner, auto_password=False, password_sent=False
+            )
+        )
+        logged_in = banner + "Last login: Tue Nov 3 14:00:00 on ttys000\n"
+        self.assertFalse(vnssh._preauth_banner_only(logged_in))
+        self.assertTrue(
+            vnssh._session_ready_for_log(
+                logged_in, auto_password=False, password_sent=False
+            )
+        )
+
+    def test_rejected_password_after_banner_stays_fatal(self) -> None:
+        text = (
+            "** WARNING: connection is not using a post-quantum "
+            "key exchange algorithm.\n"
+            "Permission denied, please try again.\n"
+            "cloudops@10.230.200.37's password: "
+        )
+        self.assertTrue(vnssh.ssh_pre_session_fatal(text))
+        self.assertFalse(
+            vnssh._session_ready_for_log(
+                text, auto_password=False, password_sent=False
+            )
+        )
+
+    def test_rejected_password_is_fatal_even_if_prompt_returns(self) -> None:
+        text = (
+            "Permission denied, please try again.\n"
+            "cloudops@10.230.200.37's password: "
+        )
+        self.assertTrue(vnssh.ssh_pre_session_fatal(text))
+        self.assertFalse(
+            vnssh.ssh_waiting_for_user_input(
+                text, auto_password=True, password_sent=True
+            )
+        )
+
     def test_banner_does_not_kill_a_live_prompt(self) -> None:
         banner = (
             "WARNING: unauthorized access denied on this device\n"

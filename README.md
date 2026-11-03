@@ -2,7 +2,7 @@
 
 Terminal SSH launcher for macOS with **Keychain password storage** and **session operation logs**. Distributed as a single `vnssh.py` file; uses the system Python 3 and OpenSSH only—no third-party packages.
 
-Current version: **1.0.7** (`vnssh --version`).
+Current version: **1.0.8** (`vnssh --version`).
 
 [中文文档](README.zh-CN.md)
 
